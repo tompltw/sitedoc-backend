@@ -63,6 +63,10 @@ async def create_issue(
     db.add(issue)
     await db.flush()
     await db.refresh(issue)
+
+    # Auto-trigger diagnosis immediately on ticket creation
+    _enqueue_diagnose_task(issue_id=str(issue.id))
+
     return issue
 
 
@@ -147,6 +151,24 @@ async def reject_fix(
     _post_system_message(str(issue_id), "Fix rejected by user. Issue reopened for review.")
 
     return issue
+
+
+def _enqueue_diagnose_task(issue_id: str) -> None:
+    """Fire-and-forget: trigger the diagnosis pipeline on issue creation."""
+    try:
+        from celery import Celery
+        import os
+        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app.send_task(
+            "src.tasks.diagnose.diagnose_issue",
+            args=[issue_id],
+            queue="agent",
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Could not enqueue diagnose task for issue %s", issue_id
+        )
 
 
 def _enqueue_fix_task(issue_id: str, tier: str = "autonomous") -> None:
