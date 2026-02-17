@@ -27,9 +27,10 @@ async def root():
     return {"message": "SiteDoc API — see /docs for API reference"}
 
 
-# Register routers (stubs for now)
-# from src.api import auth, sites, issues, chat
-# app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
-# app.include_router(sites.router, prefix="/api/v1/sites", tags=["sites"])
-# app.include_router(issues.router, prefix="/api/v1/issues", tags=["issues"])
-# app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
+# Register routers
+from src.api import auth, sites, issues, chat  # noqa: E402
+
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(sites.router, prefix="/api/v1/sites", tags=["sites"])
+app.include_router(issues.router, prefix="/api/v1/issues", tags=["issues"])
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])

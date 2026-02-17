@@ -1,10 +1,8 @@
-import asyncio
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import pool
+from sqlalchemy import engine_from_config, pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 
@@ -15,9 +13,9 @@ config = context.config
 
 # Override sqlalchemy.url from environment if set
 db_url = os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
-# Ensure sync driver for alembic (psycopg2 or asyncpg via run_sync)
-if db_url and db_url.startswith("postgresql+asyncpg"):
-    db_url = db_url  # keep asyncpg, we run async below
+# Use psycopg2 sync driver for migrations (asyncpg is for runtime only)
+if db_url and "asyncpg" in db_url:
+    db_url = db_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
 
 config.set_main_option("sqlalchemy.url", db_url)
 
@@ -45,19 +43,15 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_async_migrations() -> None:
-    connectable = async_engine_from_config(
+def run_migrations_online() -> None:
+    connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
-
-
-def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    with connectable.connect() as connection:
+        do_run_migrations(connection)
+    connectable.dispose()
 
 
 if context.is_offline_mode():
