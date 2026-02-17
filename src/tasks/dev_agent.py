@@ -1,23 +1,21 @@
 """
-Dev Agent Celery task — routed via OpenClaw (CLAWBOT).
+Dev Agent Celery task — spawns an isolated OpenClaw background agent session.
 
 Trigger: ticket moves to 'todo' stage (customer approved work).
 
-Flow:
+Flow (non-blocking):
   1. Transition issue to in_progress.
   2. Post "Starting diagnosis and fix..." message.
-  3. Fetch issue details + site credentials from DB.
-  4. Call OpenClaw agent with issue context for diagnosis and fix plan.
-  5. Post dev agent diagnostic response (agent_role='dev').
-  6. Transition issue to ready_for_qa.
-  7. Post "Fix applied — sending to QA..." message.
-  8. Enqueue QA agent task.
+  3. Fetch issue context + decrypt credentials from DB.
+  4. Build a comprehensive task prompt for the spawned agent.
+  5. Fire sessions_spawn via OpenClaw /tools/invoke — returns in <1s.
+  6. Celery task completes. The spawned agent runs async and calls back
+     POST /api/v1/internal/agent-result when done.
 """
+import base64
 import logging
 import os
 import uuid
-
-import httpx
 
 from src.tasks.base import (
     celery_app,
@@ -25,54 +23,68 @@ from src.tasks.base import (
     post_chat_message,
     transition_issue,
 )
+from src.tasks.openclaw import spawn_agent
 
 logger = logging.getLogger(__name__)
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://sitedoc:sitedoc@localhost:5432/sitedoc")
-CLAWBOT_AGENT_ID = os.getenv("CLAWBOT_AGENT_ID", "main")
-CLAWBOT_URL = os.getenv("CLAWBOT_BASE_URL", "http://127.0.0.1:18789/v1") + "/chat/completions"
-CLAWBOT_HEADERS = lambda: {
-    "Authorization": f"Bearer {os.getenv('CLAWBOT_TOKEN', '')}",
-    "Content-Type": "application/json",
-    "x-openclaw-agent-id": CLAWBOT_AGENT_ID,
-}
+INTERNAL_API_URL = os.getenv("INTERNAL_API_URL", "http://localhost:5000")
+AGENT_INTERNAL_TOKEN = os.getenv("AGENT_INTERNAL_TOKEN", "")
 
-DEV_SYSTEM_PROMPT = """You are an expert full-stack developer fixing a website issue for a \
-managed website maintenance service called SiteDoc. You have been given an issue report from \
-a customer. Analyze the issue thoroughly and describe exactly what you would do to fix it.
 
-Be specific and technical:
-- Identify the root cause
-- List exact file paths that need to be changed
-- Show specific code changes or commands to run
-- Describe verification steps to confirm the fix worked
+# ---------------------------------------------------------------------------
+# Credential decryption
+# ---------------------------------------------------------------------------
 
-Format your response in clear sections: Root Cause, Fix Plan, Verification Steps."""
+def _get_fernet():
+    """Build a Fernet instance from CREDENTIAL_ENCRYPTION_KEY (env/config)."""
+    from cryptography.fernet import Fernet
 
+    raw = os.getenv("CREDENTIAL_ENCRYPTION_KEY", "changeme32byteskeyplaceholder123").encode()
+    # Pad/truncate to exactly 32 bytes then base64url-encode → valid Fernet key
+    key = base64.urlsafe_b64encode(raw[:32].ljust(32, b"\0"))
+    return Fernet(key)
+
+
+def _decrypt(encrypted_value: str) -> str:
+    """Decrypt a Fernet-encrypted credential value."""
+    try:
+        return _get_fernet().decrypt(encrypted_value.encode()).decode()
+    except Exception as e:
+        logger.warning("[dev_agent] Could not decrypt credential: %s", e)
+        return "(decryption failed)"
+
+
+# ---------------------------------------------------------------------------
+# Issue context
+# ---------------------------------------------------------------------------
 
 def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
     """
-    Fetch issue details and site credentials for the dev agent.
-    Returns a dict with title, description, site_url, credentials summary.
+    Fetch issue details and DECRYPTED site credentials from DB.
+    Returns a rich context dict for prompt building.
     """
-    from src.db.models import Issue, Site, SiteCredential, CredentialType
+    from src.db.models import Issue, Site, SiteCredential
 
     with get_db_session(db_url) as session:
         issue = session.get(Issue, uuid.UUID(issue_id))
         if issue is None:
             raise ValueError(f"Issue {issue_id} not found")
 
-        site = session.get(Site, issue.site_id)
+        site = session.get(Site, issue.site_id) if issue.site_id else None
         site_url = site.url if site else "unknown"
         site_name = site.name if site else "unknown"
 
-        # Gather credential types (not values — values are encrypted)
         creds = (
             session.query(SiteCredential)
             .filter(SiteCredential.site_id == issue.site_id)
             .all()
-        )
-        cred_types = [c.credential_type.value for c in creds] if creds else []
+        ) if issue.site_id else []
+
+        credential_map = {
+            c.credential_type.value: _decrypt(c.encrypted_value)
+            for c in creds
+        }
 
         return {
             "issue_id": issue_id,
@@ -81,42 +93,89 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
             "site_url": site_url,
             "site_name": site_name,
             "dev_fail_count": issue.dev_fail_count,
-            "credential_types": cred_types,
+            "credential_map": credential_map,
         }
 
 
-def _build_dev_prompt(ctx: dict) -> str:
-    """Build the user-facing prompt for the dev agent."""
-    cred_info = (
-        f"Available credential types: {', '.join(ctx['credential_types'])}"
-        if ctx["credential_types"]
-        else "No credentials on file."
-    )
+# ---------------------------------------------------------------------------
+# Task prompt builder
+# ---------------------------------------------------------------------------
+
+def _build_task_prompt(ctx: dict) -> str:
+    """
+    Build the full task prompt for the spawned OpenClaw sub-agent.
+    Includes the issue context, credentials, what to do, and callback instructions.
+    """
+    cred_lines = "\n".join(
+        f"  - {k}: {v}" for k, v in ctx["credential_map"].items()
+    ) or "  (no credentials on file)"
+
     fail_note = (
-        f"\nNote: This issue has failed QA {ctx['dev_fail_count']} time(s) previously. "
-        "Review carefully and try a different approach."
+        f"\n⚠️ This fix has failed QA {ctx['dev_fail_count']} time(s) previously. "
+        "Try a different approach and be thorough.\n"
         if ctx["dev_fail_count"] > 0
         else ""
     )
 
-    return (
-        f"Site: {ctx['site_name']} ({ctx['site_url']})\n"
-        f"{cred_info}\n\n"
-        f"Issue Title: {ctx['title']}\n\n"
-        f"Issue Description:\n{ctx['description']}"
-        f"{fail_note}"
-    )
+    callback_url = f"{INTERNAL_API_URL}/api/v1/internal/agent-result"
 
+    return f"""You are the Dev Agent for SiteDoc — a managed website maintenance service.
+Your job is to IMPLEMENT the fix described below, not just plan it.
+Use your tools (exec, browser, SSH) to actually apply the change.
+{fail_note}
+## Issue
+Title: {ctx["title"]}
+Site: {ctx["site_name"]} ({ctx["site_url"]})
+
+## Description
+{ctx["description"]}
+
+## Credentials
+{cred_lines}
+
+## Instructions
+1. Analyse the issue and determine the exact fix needed.
+2. Use exec/browser/SSH to implement the fix on the live site.
+3. Verify the fix works (check the page, run tests, etc.).
+4. When finished, call the callback below — do NOT skip this step.
+
+## Callback (REQUIRED — call this when done)
+POST {callback_url}
+Headers:
+  Authorization: Bearer {AGENT_INTERNAL_TOKEN}
+  Content-Type: application/json
+Body (success):
+{{
+  "issue_id": "{ctx["issue_id"]}",
+  "agent_role": "dev",
+  "status": "success",
+  "message": "<brief summary of what you did and how you verified it>",
+  "transition_to": "ready_for_qa"
+}}
+Body (failure):
+{{
+  "issue_id": "{ctx["issue_id"]}",
+  "agent_role": "dev",
+  "status": "failure",
+  "message": "<what you tried and why it failed>",
+  "transition_to": null
+}}
+
+Start working now. Be thorough and verify before calling the callback.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Celery task
+# ---------------------------------------------------------------------------
 
 @celery_app.task(name="src.tasks.dev_agent.run")
 def run(issue_id: str) -> None:
     """
-    Run the dev agent for the given issue.
-
-    Args:
-        issue_id: UUID string of the issue.
+    Fire-and-forget: spawn an isolated OpenClaw agent session to implement
+    the fix, then return immediately. The sub-agent calls back when done.
     """
-    logger.info("[dev_agent] Starting work on issue %s", issue_id)
+    logger.info("[dev_agent] Spawning agent for issue %s", issue_id)
 
     try:
         # 1. Transition to in_progress
@@ -126,7 +185,6 @@ def run(issue_id: str) -> None:
                 to_col="in_progress",
                 actor_type="dev_agent",
                 note="Dev agent picking up ticket.",
-                db_url=DB_URL,
             )
         except Exception as e:
             logger.warning("[dev_agent] Could not transition to in_progress: %s", e)
@@ -139,63 +197,29 @@ def run(issue_id: str) -> None:
             DB_URL,
         )
 
-        # 3. Fetch issue context
+        # 3. Fetch issue context (with decrypted credentials)
         ctx = _fetch_issue_context(issue_id, DB_URL)
-        user_prompt = _build_dev_prompt(ctx)
+        task_prompt = _build_task_prompt(ctx)
 
-        # 4. Call OpenClaw agent
-        resp = httpx.post(
-            CLAWBOT_URL,
-            headers=CLAWBOT_HEADERS(),
-            json={
-                "model": f"openclaw:{CLAWBOT_AGENT_ID}",
-                "max_tokens": 4096,
-                "messages": [
-                    {"role": "system", "content": DEV_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
-            timeout=120.0,
+        # 4. Spawn isolated background agent (returns in <1s)
+        result = spawn_agent(
+            task=task_prompt,
+            label=f"dev-agent-{issue_id[:8]}",
         )
-        resp.raise_for_status()
-        dev_response = resp.json()["choices"][0]["message"]["content"].strip()
-        logger.info("[dev_agent] Got diagnostic response for issue %s (%d chars)", issue_id, len(dev_response))
+        logger.info("[dev_agent] Agent spawned for issue %s: %s", issue_id, result)
 
-        # 5. Post diagnostic response
-        post_chat_message(issue_id, dev_response, "dev", DB_URL)
-
-        # 6. Transition to ready_for_qa
-        try:
-            transition_issue(
-                issue_id=issue_id,
-                to_col="ready_for_qa",
-                actor_type="dev_agent",
-                note="Dev agent completed fix. Sending to QA.",
-                db_url=DB_URL,
-            )
-        except Exception as e:
-            logger.error("[dev_agent] Could not transition to ready_for_qa: %s", e)
-            post_chat_message(
-                issue_id,
-                "⚠️ Fix was applied but I had trouble updating the ticket stage. Notifying the team.",
-                "dev",
-                DB_URL,
-            )
-            return
-
-        # 7. Post completion message
+        # 5. Notify chat that agent is running
+        session_key = result.get("childSessionKey", "unknown")
         post_chat_message(
             issue_id,
-            "✅ Fix applied. Sending to QA for verification...",
+            f"🤖 Dev agent is running (session: `{session_key}`). "
+            "I'll update this ticket when the fix is applied.",
             "dev",
             DB_URL,
         )
 
-        # 8. Enqueue QA agent
-        _enqueue_qa_agent(issue_id)
-
     except Exception as e:
-        logger.exception("[dev_agent] Unhandled error for issue %s: %s", issue_id, e)
+        logger.exception("[dev_agent] Failed to spawn agent for issue %s: %s", issue_id, e)
         try:
             post_chat_message(
                 issue_id,
@@ -205,16 +229,3 @@ def run(issue_id: str) -> None:
             )
         except Exception:
             pass
-
-
-def _enqueue_qa_agent(issue_id: str) -> None:
-    """Fire-and-forget: enqueue the QA agent task."""
-    try:
-        celery_app.send_task(
-            "src.tasks.qa_agent.run",
-            args=[issue_id],
-            queue="agent",
-        )
-        logger.info("[dev_agent] QA agent enqueued for issue %s", issue_id)
-    except Exception as e:
-        logger.error("[dev_agent] Could not enqueue QA agent for issue %s: %s", issue_id, e)

@@ -1,3 +1,8 @@
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -28,10 +33,13 @@ async def root():
 
 
 # Register routers
-from src.api import auth, sites, issues, chat, ws  # noqa: E402
+from src.api import auth, sites, issues, chat, ws, billing, pipeline, internal  # noqa: E402
 
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(sites.router, prefix="/api/v1/sites", tags=["sites"])
 app.include_router(issues.router, prefix="/api/v1/issues", tags=["issues"])
-app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
+app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
+app.include_router(pipeline.router, prefix="/api/v1", tags=["pipeline"])
+app.include_router(billing.router, prefix="/api/v1/billing", tags=["billing"])
+app.include_router(internal.router, tags=["internal"])
 app.include_router(ws.router, tags=["websocket"])
