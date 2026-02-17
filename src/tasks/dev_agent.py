@@ -86,6 +86,22 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
             for c in creds
         }
 
+        # Fetch recent chat history so dev can see user feedback
+        from src.db.models import ChatMessage, SenderType
+
+        recent_msgs = (
+            session.query(ChatMessage)
+            .filter(ChatMessage.issue_id == uuid.UUID(issue_id))
+            .order_by(ChatMessage.created_at.desc())
+            .limit(15)
+            .all()
+        )
+        recent_msgs.reverse()
+        chat_history = [
+            {"role": m.agent_role or m.sender_type.value, "content": m.content}
+            for m in recent_msgs
+        ]
+
         return {
             "issue_id": issue_id,
             "title": issue.title or "Untitled",
@@ -94,6 +110,7 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
             "site_name": site_name,
             "dev_fail_count": issue.dev_fail_count,
             "credential_map": credential_map,
+            "chat_history": chat_history,
         }
 
 
@@ -117,6 +134,20 @@ def _build_task_prompt(ctx: dict) -> str:
         else ""
     )
 
+    # Recent conversation so dev can see user feedback verbatim
+    history_section = ""
+    if ctx.get("chat_history"):
+        role_labels = {"user": "👤 Customer", "pm": "🤖 PM", "dev": "🔧 Dev", "qa": "🧪 QA", "system": "⚙️ System"}
+        lines = []
+        for msg in ctx["chat_history"]:
+            label = role_labels.get(msg["role"], msg["role"])
+            lines.append(f"{label}: {msg['content'][:600]}")
+        history_section = (
+            "\n\n## Recent conversation (read carefully — customer feedback is here)\n"
+            + "\n\n".join(lines)
+            + "\n\n⚠️ The customer's messages above describe EXACTLY what is wrong. Fix the specific issue they mention."
+        )
+
     callback_url = f"{INTERNAL_API_URL}/api/v1/internal/agent-result"
 
     return f"""You are the Dev Agent for SiteDoc — a managed website maintenance service.
@@ -129,15 +160,17 @@ Site: {ctx["site_name"]} ({ctx["site_url"]})
 
 ## Description
 {ctx["description"]}
+{history_section}
 
 ## Credentials
 {cred_lines}
 
 ## Instructions
-1. Analyse the issue and determine the exact fix needed.
-2. Use exec/browser/SSH to implement the fix on the live site.
-3. Verify the fix works (check the page, run tests, etc.).
-4. When finished, call the callback below — do NOT skip this step.
+1. Read the description AND the conversation history above carefully.
+2. If the customer provided specific feedback about what is wrong, fix THAT exact issue.
+3. Use exec/browser/SSH to implement the fix on the live site.
+4. Verify the fix works (check the page, confirm the specific issue is resolved).
+5. When finished, call the callback below — do NOT skip this step.
 
 ## Callback (REQUIRED — call this when done)
 POST {callback_url}

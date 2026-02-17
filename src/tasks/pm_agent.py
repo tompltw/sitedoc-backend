@@ -72,9 +72,24 @@ Collect ALL of the following before confirming:
 
 Once you have all details, confirm with the customer. When they confirm, emit the ticket_confirmed JSON.
 
+## ready_for_uat stage (customer is reviewing the fix)
+The customer has just reviewed the completed work. Two outcomes:
+- Customer APPROVES: thank them, transition to `done`.
+- Customer reports a PROBLEM or requests a CHANGE:
+  1. Extract the EXACT issue they describe — be precise, include specific details (e.g. "greeting shows above the form, should be below").
+  2. Emit a `ticket_action` to transition to `todo` so dev picks it up immediately.
+  3. ALSO emit an `update_description` JSON with the appended feedback so dev knows exactly what to fix:
+     {{"update_description": true, "append": "<user feedback verbatim + your clarification>"}}
+  4. Tell the customer: "Got it, sending this back to the team to fix."
+  Do NOT ask clarifying questions — act on what they said immediately.
+
+## ready_for_uat_approval stage (waiting for customer to approve starting work)
+Customer is reviewing the ticket summary before work begins. If they approve, transition to `todo`.
+If they want changes to the plan, update accordingly and re-confirm.
+
 ## Other stages
-If the customer asks about status or confirms work is done, check the current stage and respond accordingly.
-If work is complete and the customer confirms it, transition to 'done' using ticket_action JSON — do not ask the customer for any IDs."""
+If the customer asks about status, give a brief update based on the current stage.
+If work is complete and the customer confirms it, transition to `done`."""
 
 
 def _get_issue_context(issue_id: str, db_url: str) -> dict:
@@ -148,12 +163,39 @@ def _extract_transition_json(text: str) -> Optional[str]:
     return None
 
 
+def _extract_description_update(text: str) -> Optional[str]:
+    """
+    Look for {update_description: true, append: "..."} in agent reply.
+    Returns the text to append, or None.
+    """
+    pattern = r'\{[^{}]*"update_description"\s*:\s*true[^{}]*\}'
+    for raw in re.findall(pattern, text, re.DOTALL):
+        try:
+            data = json.loads(raw)
+            if data.get("update_description") is True and data.get("append"):
+                return data["append"]
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _append_issue_description(issue_id: str, append_text: str, db_url: str) -> None:
+    """Append user feedback to the issue description so dev agent sees it."""
+    from src.db.models import Issue
+
+    with get_db_session(db_url) as session:
+        issue = session.get(Issue, uuid.UUID(issue_id))
+        if issue is None:
+            return
+        existing = issue.description or ""
+        issue.description = existing + f"\n\n---\n**Customer Feedback:**\n{append_text}"
+
+
 def _strip_json_blocks(text: str) -> str:
     """Remove internal JSON action blocks from agent reply before showing to customer."""
-    # Remove ticket_action blocks
     text = re.sub(r'\{[^{}]*"ticket_action"[^{}]*\}\n?', '', text)
-    # Remove ticket_confirmed blocks
     text = re.sub(r'\{[^{}]*"ticket_confirmed"[^{}]*\}\n?', '', text)
+    text = re.sub(r'\{[^{}]*"update_description"[^{}]*\}\n?', '', text)
     return text.strip()
 
 
@@ -227,7 +269,16 @@ def handle_message(issue_id: str, user_message: str) -> None:
         if visible_reply:
             post_chat_message(issue_id, visible_reply, "pm", DB_URL)
 
-        # 6. Handle ticket_action transition (silent — not shown to customer)
+        # 6. Handle description update (append user feedback before transitioning)
+        description_append = _extract_description_update(agent_reply)
+        if description_append:
+            try:
+                _append_issue_description(issue_id, description_append, DB_URL)
+                logger.info("[pm_agent] Appended feedback to issue %s description", issue_id)
+            except Exception as e:
+                logger.error("[pm_agent] Failed to update description for %s: %s", issue_id, e)
+
+        # 7. Handle ticket_action transition (silent — not shown to customer)
         to_col = _extract_transition_json(agent_reply)
         if to_col:
             logger.info("[pm_agent] Transitioning issue %s → %s (ticket_action)", issue_id, to_col)
