@@ -144,6 +144,9 @@ async def post_message(
     if is_first_message:
         _enqueue_diagnose_task(issue_id=str(issue_id))
 
+    # Always enqueue chat reply for every user message
+    _enqueue_chat_reply(issue_id=str(issue_id), message_content=body.content)
+
     return message
 
 
@@ -202,6 +205,22 @@ def _enqueue_memory_extraction(
         logging.getLogger(__name__).warning(
             "Could not enqueue memory extraction (Celery unavailable?)"
         )
+
+
+def _enqueue_chat_reply(issue_id: str, message_content: str) -> None:
+    """Fire-and-forget: enqueue a Celery chat reply task for the user message."""
+    try:
+        from celery import Celery
+        import os
+        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app.send_task(
+            "src.tasks.chat_reply.reply_to_user",
+            args=[issue_id, message_content],
+            queue="agent",
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Could not enqueue chat reply for issue %s", issue_id)
 
 
 def _enqueue_diagnose_task(issue_id: str) -> None:
