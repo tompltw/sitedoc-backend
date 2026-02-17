@@ -23,12 +23,16 @@ from typing import Optional
 import requests
 
 from src.tasks.llm import call_llm
+from src.tasks.openclaw import spawn_agent
 from src.tasks.base import (
     celery_app,
     get_db_session,
     post_chat_message,
     transition_issue,
 )
+
+INTERNAL_API_URL = os.getenv("INTERNAL_API_URL", "http://localhost:5000")
+AGENT_INTERNAL_TOKEN = os.getenv("AGENT_INTERNAL_TOKEN", "")
 
 logger = logging.getLogger(__name__)
 
@@ -89,11 +93,37 @@ def _fetch_qa_context(issue_id: str, db_url: str) -> dict:
         }
 
 
-def _http_check(site_url: str) -> tuple[int, str, str]:
+def _extract_meaningful_html(html: str, max_chars: int = 12000) -> str:
+    """
+    Extract the most meaningful portion of an HTML page for QA verification.
+    Prioritises <body> content over <head> CSS/scripts, which dominate the
+    first 8 000 chars of most WordPress pages and obscure the actual UI.
+    Returns up to max_chars characters.
+    """
+    if not html:
+        return ""
+
+    # 1. Try to extract everything from <body …> onward
+    body_start = html.lower().find("<body")
+    if body_start != -1:
+        body_content = html[body_start:]
+        # If it fits, return it all (up to max_chars)
+        return body_content[:max_chars]
+
+    # 2. Fallback: return the raw HTML truncated
+    return html[:max_chars]
+
+
+def _http_check(site_url: str, extra_paths: list[str] | None = None) -> tuple[int, str, str]:
     """
     Perform a basic HTTP GET on the site URL and return the page HTML.
     Falls back to HTTP if HTTPS fails with an SSL/connection error.
-    Returns (status_code, summary_string, page_html).
+
+    If extra_paths is provided (e.g. ["/hello-user/"]), each path is tried in
+    order and the first successful response with a non-trivial body is used.
+    The homepage is always tried as a final fallback.
+
+    Returns (status_code, summary_string, meaningful_page_html).
     """
     if not site_url:
         return 0, "No site URL configured", ""
@@ -101,8 +131,9 @@ def _http_check(site_url: str) -> tuple[int, str, str]:
     def _try(url: str) -> tuple[int, str, str]:
         try:
             resp = requests.get(url, timeout=15, allow_redirects=True, verify=False)
-            # Truncate HTML to 8000 chars to keep LLM context manageable
-            html = resp.text[:8000] if resp.text else ""
+            # Extract body content rather than raw first N chars so that
+            # WordPress CSS in <head> doesn't consume the entire context window.
+            html = _extract_meaningful_html(resp.text) if resp.text else ""
             return resp.status_code, f"HTTP {resp.status_code}", html
         except requests.exceptions.SSLError:
             return None, "SSL error", ""
@@ -113,18 +144,212 @@ def _http_check(site_url: str) -> tuple[int, str, str]:
         except Exception as e:
             return None, f"Error: {str(e)[:100]}", ""
 
-    status, msg, html = _try(site_url)
-    if status is not None:
-        return status, msg, html
+    # Build ordered list of URLs to try: extra paths first, then the site root
+    base = site_url.rstrip("/")
+    urls_to_try: list[str] = []
+    if extra_paths:
+        for path in extra_paths:
+            urls_to_try.append(base + "/" + path.lstrip("/"))
+    urls_to_try.append(site_url)  # always try root as fallback
 
-    # If HTTPS failed, retry with HTTP
-    if site_url.startswith("https://"):
-        http_url = site_url.replace("https://", "http://", 1)
-        status2, msg2, html2 = _try(http_url)
-        if status2 is not None:
-            return status2, f"{msg2} (via HTTP fallback)", html2
+    last_status, last_msg, last_html = 0, "No URL tried", ""
+    for url in urls_to_try:
+        status, msg, html = _try(url)
+        if status is not None:
+            last_status, last_msg, last_html = status, msg, html
+            if status == 200 and html:
+                return status, f"{msg} (url: {url})", html
+        elif site_url.startswith("https://"):
+            # Try HTTP fallback for this specific URL
+            http_url = url.replace("https://", "http://", 1)
+            status2, msg2, html2 = _try(http_url)
+            if status2 is not None:
+                last_status, last_msg, last_html = status2, msg2, html2
+                if status2 == 200 and html2:
+                    return status2, f"{msg2} via HTTP fallback (url: {http_url})", html2
 
-    return 0, msg, ""
+    return last_status, last_msg, last_html
+
+
+def _extract_page_paths_from_description(description: str) -> list[str]:
+    """
+    Heuristically extract page paths/slugs mentioned in the issue description.
+    Returns a list of paths to try (e.g. ['/hello-user/']).
+    """
+    import re
+    paths: list[str] = []
+
+    # Look for quoted page titles like 'Hello User' → /hello-user/
+    title_matches = re.findall(r"['\"]([A-Za-z][A-Za-z0-9 _-]{1,40})['\"]", description)
+    for title in title_matches:
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        if slug:
+            paths.append(f"/{slug}/")
+
+    # Look for explicit paths like /hello-user/ or hello-user
+    path_matches = re.findall(r"/[a-z][a-z0-9-]+/", description)
+    paths.extend(path_matches)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+def _extract_feature_url(site_url: str, description: str) -> Optional[str]:
+    """
+    Extract a specific page URL from the issue description.
+    Looks for patterns like 'Hello User page' → /hello-user/,
+    or slug hints from the description.
+    Returns a full URL if found, else None.
+    """
+    import re as _re
+
+    # Normalise site_url (no trailing slash)
+    base = site_url.rstrip("/")
+
+    # 1. Look for explicit URLs in the description that are under the same site
+    url_pattern = _re.compile(r'https?://\S+', _re.IGNORECASE)
+    for match in url_pattern.finditer(description):
+        url = match.group(0).rstrip('.,)')
+        if base in url and url != base and url != base + "/":
+            return url
+
+    # 2. Look for page titles like 'Hello User' and derive slug
+    page_title_pattern = _re.compile(
+        r"['\"]([A-Za-z][A-Za-z0-9 \-]+)['\"].*?page|page.*?['\"]([A-Za-z][A-Za-z0-9 \-]+)['\"]",
+        _re.IGNORECASE
+    )
+    for match in page_title_pattern.finditer(description):
+        title = match.group(1) or match.group(2)
+        if title:
+            slug = title.strip().lower().replace(" ", "-")
+            return f"{base}/{slug}/"
+
+    return None
+
+
+def _http_check_feature(site_url: str, feature_url: str) -> str:
+    """
+    Fetch the feature-specific page (GET) and also POST test form data if a form is present.
+    Returns a combined HTML/summary string for the QA LLM.
+    """
+    sections = []
+
+    # GET the feature page
+    try:
+        resp = requests.get(feature_url, timeout=15, allow_redirects=True, verify=False)
+        # Use body extraction to skip the large <head> CSS block in WordPress pages
+        html_get = _extract_meaningful_html(resp.text, max_chars=8000)
+        sections.append(f"### GET {feature_url} → HTTP {resp.status_code}\n{html_get}")
+
+        # If the page has a form, do a POST with test data to verify greeting
+        if "<form" in resp.text.lower():
+            # Detect field names from the full (non-truncated) HTML
+            field_names = re.findall(r'name="([^"]+)"', resp.text)
+            # Build POST data: fill text-like fields with test values
+            post_data = {}
+            test_first = "Jane"
+            test_last = "Smith"
+            for fname in field_names:
+                fl = fname.lower()
+                if "first" in fl or "fname" in fl or fname in ("hu_first_name", "first_name"):
+                    post_data[fname] = test_first
+                elif "last" in fl or "lname" in fl or "surname" in fl or fname in ("hu_last_name", "last_name"):
+                    post_data[fname] = test_last
+                elif fname in ("hu_submit",):
+                    post_data[fname] = "1"
+                elif "nonce" in fl or "_wpnonce" in fl or "token" in fl or "csrf" in fl:
+                    # Try to pull nonce value from the form HTML
+                    nonce_match = re.search(
+                        rf'name="{re.escape(fname)}"[^>]*value="([^"]*)"',
+                        resp.text
+                    )
+                    if nonce_match:
+                        post_data[fname] = nonce_match.group(1)
+                # skip submit buttons and hidden fields we don't understand
+            if post_data:
+                try:
+                    post_resp = requests.post(
+                        feature_url, data=post_data,
+                        timeout=15, allow_redirects=True, verify=False,
+                        headers={"Referer": feature_url, "Content-Type": "application/x-www-form-urlencoded"}
+                    )
+                    # Extract body from POST response as well
+                    html_post = _extract_meaningful_html(post_resp.text, max_chars=6000)
+                    sections.append(
+                        f"### POST {feature_url} (test data: first={test_first!r}, last={test_last!r})"
+                        f" → HTTP {post_resp.status_code}\n{html_post}"
+                    )
+                except Exception as e:
+                    sections.append(f"### POST {feature_url} → Error: {e}")
+    except Exception as e:
+        sections.append(f"### GET {feature_url} → Error: {e}")
+
+    return "\n\n".join(sections)
+
+
+def _build_qa_task_prompt(ctx: dict) -> str:
+    """Build the task prompt for the spawned QA sub-agent (browser-based)."""
+    callback_url = f"{INTERNAL_API_URL}/api/v1/internal/agent-result"
+    feature_url = _extract_feature_url(ctx["site_url"], ctx["description"])
+    target_url = feature_url or ctx["site_url"]
+
+    return f"""You are the QA Agent for SiteDoc — a managed website maintenance service.
+Your job is to VISUALLY verify that the fix meets the customer's requirements using your browser.
+Do NOT rely on the dev agent's self-reported summary.
+
+## Original requirements (source of truth)
+{ctx["description"]}
+
+## Dev fix summary (for reference only — verify independently)
+{ctx["last_dev_message"][:800]}
+
+## Site
+{ctx["site_url"]}
+Target page: {target_url}
+
+## QA Instructions (follow in order)
+1. Open the browser and navigate to: {target_url}
+2. Take a screenshot of the page as it loads.
+3. If there is a form, fill it in with test data (e.g. First Name = "Jane", Last Name = "Smith") and submit.
+4. Take a screenshot AFTER form submission.
+5. Check EVERY requirement from the original description against what you see visually:
+   - Layout (left/right, above/below, order of elements)
+   - Content (correct text, correct colours, correct behaviour)
+   - Edge cases mentioned in the requirements
+6. Do NOT pass if ANY requirement is not met visually.
+
+## Callback (REQUIRED)
+POST {callback_url}
+Headers:
+  Authorization: Bearer {AGENT_INTERNAL_TOKEN}
+  Content-Type: application/json
+
+Body if QA PASSED:
+{{
+  "issue_id": "{ctx["issue_id"]}",
+  "agent_role": "qa",
+  "status": "success",
+  "message": "<what you verified and how it looks — describe the visual layout>",
+  "transition_to": "ready_for_uat"
+}}
+
+Body if QA FAILED:
+{{
+  "issue_id": "{ctx["issue_id"]}",
+  "agent_role": "qa",
+  "status": "failure",
+  "message": "<exact requirement that failed and what you saw instead — be specific>",
+  "transition_to": "todo"
+}}
+
+Start the browser now and verify visually.
+"""
 
 
 def _parse_qa_result(text: str) -> Optional[dict]:
@@ -180,79 +405,23 @@ def run(issue_id: str) -> None:
         # 3. Fetch context
         ctx = _fetch_qa_context(issue_id, DB_URL)
 
-        # 4. HTTP check — fetch page HTML for real verification
-        http_status, http_summary, page_html = _http_check(ctx["site_url"])
-        logger.info("[qa_agent] Site %s returned %s", ctx["site_url"], http_summary)
-
-        # 5. Call OpenClaw agent with actual page content
-        qa_prompt = (
-            f"## Original customer requirements\n{ctx['description']}\n\n"
-            f"## Dev agent fix summary\n{ctx['last_dev_message']}\n\n"
-            f"## Live site HTTP check\nStatus: {http_summary} ({http_status})\n\n"
-            f"## Live page HTML (first 8000 chars)\n{page_html}\n\n"
-            f"Verify each requirement against the live HTML above. "
-            f"Pay special attention to the ORDER elements appear in the HTML."
+        # 4. Build browser-based QA task and spawn isolated agent
+        task_prompt = _build_qa_task_prompt(ctx)
+        result = spawn_agent(
+            task=task_prompt,
+            label=f"qa-agent-{issue_id[:8]}",
         )
+        logger.info("[qa_agent] QA agent spawned for issue %s: %s", issue_id, result)
 
-        qa_response_text = call_llm(
-            system_prompt=QA_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": qa_prompt}],
-        ).strip()
-        logger.info("[qa_agent] QA response for issue %s: %s", issue_id, qa_response_text[:200])
-
-        # 6. Parse result
-        result = _parse_qa_result(qa_response_text)
-        if result is None:
-            # Can't parse — treat as failure to be safe
-            logger.warning("[qa_agent] Could not parse QA result for issue %s, treating as fail", issue_id)
-            result = {"passed": False, "reason": "QA agent could not parse verification result — manual review needed."}
-
-        if result["passed"]:
-            # --- QA PASSED ---
-            try:
-                transition_issue(
-                    issue_id=issue_id,
-                    to_col="ready_for_uat",
-                    actor_type="qa_agent",
-                    note=f"QA passed. {result.get('reason', '')}",
-                    db_url=DB_URL,
-                )
-            except Exception as e:
-                logger.error("[qa_agent] Could not transition to ready_for_uat: %s", e)
-
-            post_chat_message(
-                issue_id,
-                "✅ QA passed. Ready for your review!",
-                "qa",
-                DB_URL,
-            )
-            logger.info("[qa_agent] Issue %s passed QA", issue_id)
-
-        else:
-            # --- QA FAILED ---
-            reason = result.get("reason", "Verification failed.")
-            logger.info("[qa_agent] Issue %s failed QA: %s", issue_id, reason)
-
-            try:
-                transition_issue(
-                    issue_id=issue_id,
-                    to_col="todo",
-                    actor_type="qa_agent",
-                    note=f"QA failed: {reason}",
-                    db_url=DB_URL,
-                )
-            except Exception as e:
-                logger.error("[qa_agent] Could not transition to todo: %s", e)
-
-            post_chat_message(
-                issue_id,
-                f"❌ QA failed: {reason}. Sending back to dev.",
-                "qa",
-                DB_URL,
-            )
-
-            # Re-enqueue dev agent for another attempt
-            _enqueue_dev_agent(issue_id)
+        # 5. Notify chat that QA is running
+        details = result.get("details") or result
+        session_key = details.get("childSessionKey", "unknown")
+        post_chat_message(
+            issue_id,
+            f"🔎 QA agent is verifying visually (session: `{session_key}`). Will update when done.",
+            "qa",
+            DB_URL,
+        )
 
     except Exception as e:
         logger.exception("[qa_agent] Unhandled error for issue %s: %s", issue_id, e)

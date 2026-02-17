@@ -167,10 +167,15 @@ Site: {ctx["site_name"]} ({ctx["site_url"]})
 
 ## Instructions
 1. Read the description AND the conversation history above carefully.
-2. If the customer provided specific feedback about what is wrong, fix THAT exact issue.
-3. Use exec/browser/SSH to implement the fix on the live site.
-4. Verify the fix works (check the page, confirm the specific issue is resolved).
-5. When finished, call the callback below — do NOT skip this step.
+2. If the customer provided specific feedback about what is wrong, fix THAT exact issue — not the general description.
+3. Use exec/SSH to implement the fix on the live site.
+4. **REQUIRED — Visual verification via browser:**
+   - Open the browser and navigate to the relevant page on the site
+   - Interact with the feature (fill forms, click buttons, etc.)
+   - Take a screenshot and visually confirm the fix matches the requirements exactly
+   - Check layout (left/right position, above/below order), content, and behaviour
+   - Do NOT self-report success based on reading your own code — verify by seeing it in the browser
+5. When finished (and only after visual confirmation), call the callback below.
 
 ## Callback (REQUIRED — call this when done)
 POST {callback_url}
