@@ -103,10 +103,10 @@ async def approve_fix(
     """
     issue = await _get_issue_for_customer(issue_id, current_customer.id, db)
 
-    if issue.status != IssueStatus.in_progress:
+    if issue.status != IssueStatus.pending_approval:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Issue is '{issue.status.value}' — only 'in_progress' (pending_approval) issues can be approved",
+            detail=f"Issue is '{issue.status.value}' — only 'pending_approval' issues can be approved",
         )
 
     # Confidence gate check — if somehow < 60%, don't allow approval
@@ -133,7 +133,7 @@ async def reject_fix(
     """
     issue = await _get_issue_for_customer(issue_id, current_customer.id, db)
 
-    if issue.status not in (IssueStatus.in_progress, IssueStatus.open):
+    if issue.status not in (IssueStatus.in_progress, IssueStatus.pending_approval, IssueStatus.open):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Cannot reject fix for issue in '{issue.status.value}' state",

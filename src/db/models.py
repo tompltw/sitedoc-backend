@@ -34,6 +34,7 @@ class SiteStatus(PyEnum):
 class IssueStatus(PyEnum):
     open = "open"
     in_progress = "in_progress"
+    pending_approval = "pending_approval"
     resolved = "resolved"
     dismissed = "dismissed"
 
@@ -73,7 +74,7 @@ class Customer(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     stripe_customer_id = Column(String(255), unique=True)
-    plan = Column(Enum(PlanType), nullable=False, default=PlanType.free)
+    plan = Column(Enum(PlanType, name="plan_type", create_type=False), nullable=False, default=PlanType.free)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     sites = relationship("Site", back_populates="customer", cascade="all, delete-orphan")
@@ -88,7 +89,7 @@ class Site(Base):
     customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False)
     url = Column(String(2048), nullable=False)
     name = Column(String(255), nullable=False)
-    status = Column(Enum(SiteStatus), nullable=False, default=SiteStatus.active)
+    status = Column(Enum(SiteStatus, name="site_status", create_type=False), nullable=False, default=SiteStatus.active)
     last_health_check = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -104,7 +105,7 @@ class SiteCredential(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     site_id = Column(UUID(as_uuid=True), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
-    credential_type = Column(Enum(CredentialType), nullable=False)
+    credential_type = Column(Enum(CredentialType, name="credential_type", create_type=False), nullable=False)
     encrypted_value = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -119,8 +120,8 @@ class Issue(Base):
     customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False)
     title = Column(String(500), nullable=False)
     description = Column(Text)
-    status = Column(Enum(IssueStatus), nullable=False, default=IssueStatus.open)
-    priority = Column(Enum(IssuePriority), nullable=False, default=IssuePriority.medium)
+    status = Column(Enum(IssueStatus, name="issue_status", create_type=False), nullable=False, default=IssueStatus.open)
+    priority = Column(Enum(IssuePriority, name="issue_priority", create_type=False), nullable=False, default=IssuePriority.medium)
     confidence_score = Column(Float)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     resolved_at = Column(DateTime(timezone=True))
@@ -138,7 +139,7 @@ class AgentAction(Base):
     issue_id = Column(UUID(as_uuid=True), ForeignKey("issues.id", ondelete="CASCADE"), nullable=False)
     action_type = Column(String(100), nullable=False)
     description = Column(Text)
-    status = Column(Enum(ActionStatus), nullable=False, default=ActionStatus.pending)
+    status = Column(Enum(ActionStatus, name="action_status", create_type=False), nullable=False, default=ActionStatus.pending)
     before_state = Column(Text)  # JSON snapshot
     after_state = Column(Text)   # JSON snapshot
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -151,7 +152,7 @@ class ChatMessage(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     issue_id = Column(UUID(as_uuid=True), ForeignKey("issues.id", ondelete="CASCADE"), nullable=False)
-    sender_type = Column(Enum(SenderType), nullable=False)
+    sender_type = Column(Enum(SenderType, name="sender_type", create_type=False), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
