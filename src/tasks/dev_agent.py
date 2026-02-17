@@ -87,7 +87,7 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
         }
 
         # Fetch recent chat history so dev can see user feedback
-        from src.db.models import ChatMessage, SenderType
+        from src.db.models import ChatMessage, SenderType, TicketAttachment
 
         recent_msgs = (
             session.query(ChatMessage)
@@ -102,6 +102,24 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
             for m in recent_msgs
         ]
 
+        # Fetch attachments for this issue
+        attachments = (
+            session.query(TicketAttachment)
+            .filter(TicketAttachment.issue_id == uuid.UUID(issue_id))
+            .order_by(TicketAttachment.created_at.asc())
+            .all()
+        )
+        attachment_list = [
+            {
+                "id": str(a.id),
+                "filename": a.filename,
+                "mime_type": a.mime_type,
+                "size_bytes": a.size_bytes,
+                "download_url": f"http://localhost:5000/api/v1/issues/{issue_id}/attachments/{a.id}/download",
+            }
+            for a in attachments
+        ]
+
         return {
             "issue_id": issue_id,
             "title": issue.title or "Untitled",
@@ -111,6 +129,7 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
             "dev_fail_count": issue.dev_fail_count,
             "credential_map": credential_map,
             "chat_history": chat_history,
+            "attachments": attachment_list,
         }
 
 
@@ -148,6 +167,20 @@ def _build_task_prompt(ctx: dict) -> str:
             + "\n\n⚠️ The customer's messages above describe EXACTLY what is wrong. Fix the specific issue they mention."
         )
 
+    # Build attachments section for the prompt
+    attachments_section = ""
+    if ctx.get("attachments"):
+        lines = []
+        for a in ctx["attachments"]:
+            size_kb = f"{a['size_bytes'] // 1024} KB" if a.get("size_bytes") else "unknown size"
+            lines.append(f"  - {a['filename']} ({size_kb}) → {a['download_url']}")
+        attachments_section = (
+            "\n\n## Attachments\n"
+            "The following files have been attached to this ticket. "
+            "You can curl/fetch these URLs to read them if relevant to the fix:\n"
+            + "\n".join(lines)
+        )
+
     callback_url = f"{INTERNAL_API_URL}/api/v1/internal/agent-result"
 
     return f"""You are the Dev Agent for SiteDoc — a managed website maintenance service.
@@ -160,7 +193,7 @@ Site: {ctx["site_name"]} ({ctx["site_url"]})
 
 ## Description
 {ctx["description"]}
-{history_section}
+{history_section}{attachments_section}
 
 ## Credentials
 {cred_lines}

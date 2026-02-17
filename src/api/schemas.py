@@ -9,7 +9,7 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr
 
-from src.db.models import CredentialType, IssueStatus, IssuePriority, SiteStatus, SenderType, PlanType
+from src.db.models import CredentialType, IssueStatus, IssuePriority, SiteStatus, SenderType, PlanType, KanbanColumn, AgentRole
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +100,10 @@ class IssueResponse(BaseModel):
     status: IssueStatus
     priority: IssuePriority
     confidence_score: Optional[float] = None
+    kanban_column: KanbanColumn = KanbanColumn.triage
+    dev_fail_count: int = 0
+    ticket_number: Optional[int] = None
+    stall_check_at: Optional[datetime] = None
     created_at: datetime
     resolved_at: Optional[datetime] = None
 
@@ -108,6 +112,43 @@ class IssueResponse(BaseModel):
 
 class IssueStatusUpdate(BaseModel):
     status: IssueStatus
+
+
+class IssueTransitionRequest(BaseModel):
+    to_col: KanbanColumn
+    note: Optional[str] = None
+
+
+class TicketTransitionResponse(BaseModel):
+    id: uuid.UUID
+    issue_id: uuid.UUID
+    from_col: Optional[KanbanColumn] = None
+    to_col: KanbanColumn
+    actor_type: str
+    actor_id: Optional[uuid.UUID] = None
+    note: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Site agent schemas
+# ---------------------------------------------------------------------------
+
+class SiteAgentCreate(BaseModel):
+    agent_role: AgentRole
+    model: str = "claude-haiku-4-5"
+
+
+class SiteAgentResponse(BaseModel):
+    id: uuid.UUID
+    site_id: uuid.UUID
+    agent_role: str
+    model: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +164,20 @@ class MessageResponse(BaseModel):
     issue_id: uuid.UUID
     sender_type: SenderType
     content: str
+    agent_role: Optional[str] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Billing schemas
+# ---------------------------------------------------------------------------
+
+class CheckoutSessionResponse(BaseModel):
+    checkout_url: str
+    session_id: str
+
+
+class BillingPortalResponse(BaseModel):
+    portal_url: str

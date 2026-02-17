@@ -115,6 +115,12 @@ async def update_status(
     issue.status = body.status
     if body.status == IssueStatus.resolved:
         issue.resolved_at = datetime.now(timezone.utc)
+        # Keep kanban column in sync — resolved tickets belong in done
+        if issue.kanban_column not in (KanbanColumn.done, KanbanColumn.dismissed):
+            issue.kanban_column = KanbanColumn.done
+    elif body.status == IssueStatus.dismissed:
+        if issue.kanban_column != KanbanColumn.dismissed:
+            issue.kanban_column = KanbanColumn.dismissed
     await db.flush()
     await db.refresh(issue)
     return issue
@@ -256,7 +262,7 @@ def _enqueue_diagnose_task(issue_id: str) -> None:
     try:
         from celery import Celery
         import os
-        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
         celery_app.send_task(
             "src.tasks.diagnose.diagnose_issue",
             args=[issue_id],
@@ -270,16 +276,15 @@ def _enqueue_diagnose_task(issue_id: str) -> None:
 
 
 def _enqueue_fix_task(issue_id: str, tier: str = "autonomous") -> None:
-    """Fire-and-forget: trigger the full fix pipeline."""
+    """Fire-and-forget: trigger the full fix pipeline via dev_agent."""
     try:
         from celery import Celery
         import os
-        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
         celery_app.send_task(
-            "src.tasks.fix.apply_fix",
+            "src.tasks.dev_agent.run",
             args=[issue_id],
-            kwargs={"tier": tier},
-            queue="agent",
+            queue="backend",
         )
     except Exception:
         import logging
@@ -293,12 +298,12 @@ def _enqueue_tech_lead_task(issue_id: str, fail_count: int) -> None:
     try:
         from celery import Celery
         import os
-        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
         celery_app.send_task(
-            "src.tasks.tech_lead.handle_escalation",
+            "src.tasks.tech_lead_agent.run",
             args=[issue_id],
-            kwargs={"fail_count": fail_count},
-            queue="agent",
+            kwargs={"reason": f"dev_fail_count={fail_count}"},
+            queue="backend",
         )
     except Exception:
         import logging
@@ -312,7 +317,7 @@ def _post_system_message(issue_id: str, content: str) -> None:
     try:
         from celery import Celery
         import os
-        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
         celery_app.send_task(
             "src.tasks.messaging.post_system_message",
             args=[issue_id, content],

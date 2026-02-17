@@ -11,7 +11,7 @@ import logging
 from typing import Optional
 from uuid import UUID
 
-import anthropic
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 
@@ -19,15 +19,17 @@ from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Haiku client — cheap, fast, fire-and-forget
-_client: Optional[anthropic.AsyncAnthropic] = None
+
+def _clawbot_url() -> str:
+    return settings.CLAWBOT_BASE_URL.rstrip("/") + "/chat/completions"
 
 
-def get_client() -> anthropic.AsyncAnthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-    return _client
+def _clawbot_headers(agent_id: str) -> dict:
+    return {
+        "Authorization": f"Bearer {settings.CLAWBOT_TOKEN}",
+        "Content-Type": "application/json",
+        "x-openclaw-agent-id": agent_id,
+    }
 
 
 EXTRACTION_SYSTEM = """You are a message classifier and data extractor for a website maintenance AI.
@@ -112,17 +114,24 @@ async def extract_and_store(
     Called async from Celery worker — does NOT block the response.
     """
     try:
-        client = get_client()
+        agent_id = settings.CLAWBOT_AGENT_ID
 
-        # Call Haiku for classification + extraction
-        response = await client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1024,
-            system=EXTRACTION_SYSTEM,
-            messages=[{"role": "user", "content": message_content}],
-        )
-
-        raw = response.content[0].text.strip()
+        # Call clawbot via plain httpx — no external AI SDK
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                _clawbot_url(),
+                headers=_clawbot_headers(agent_id),
+                json={
+                    "model": f"openclaw:{agent_id}",
+                    "max_tokens": 1024,
+                    "messages": [
+                        {"role": "system", "content": EXTRACTION_SYSTEM},
+                        {"role": "user", "content": message_content},
+                    ],
+                },
+            )
+        response.raise_for_status()
+        raw = response.json()["choices"][0]["message"]["content"].strip()
 
         # Parse JSON response
         try:
@@ -134,7 +143,7 @@ async def extract_and_store(
             if start >= 0 and end > start:
                 result = json.loads(raw[start:end])
             else:
-                logger.warning("Haiku returned non-JSON: %s", raw[:200])
+                logger.warning("clawbot returned non-JSON: %s", raw[:200])
                 return {"stored": 0}
 
         extractions = result.get("extractions", [])

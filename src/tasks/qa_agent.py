@@ -62,7 +62,7 @@ def _fetch_qa_context(issue_id: str, db_url: str) -> dict:
     """
     Fetch issue description, site URL, and the last dev agent message.
     """
-    from src.db.models import Issue, Site, ChatMessage, SenderType
+    from src.db.models import Issue, Site, ChatMessage, SenderType, TicketAttachment
 
     with get_db_session(db_url) as session:
         issue = session.get(Issue, uuid.UUID(issue_id))
@@ -84,12 +84,32 @@ def _fetch_qa_context(issue_id: str, db_url: str) -> dict:
             .first()
         )
 
+        # Fetch attachments for this issue
+        attachments = (
+            session.query(TicketAttachment)
+            .filter(TicketAttachment.issue_id == uuid.UUID(issue_id))
+            .order_by(TicketAttachment.created_at.asc())
+            .all()
+        )
+        attachment_list = [
+            {
+                "id": str(a.id),
+                "filename": a.filename,
+                "mime_type": a.mime_type,
+                "size_bytes": a.size_bytes,
+                "download_url": f"http://localhost:5000/api/v1/issues/{issue_id}/attachments/{a.id}/download",
+            }
+            for a in attachments
+        ]
+
         return {
+            "issue_id": issue_id,
             "title": issue.title or "Untitled",
             "description": issue.description or "No description provided.",
             "site_url": site_url,
             "last_dev_message": last_dev_msg.content if last_dev_msg else "No dev message found.",
             "dev_fail_count": issue.dev_fail_count,
+            "attachments": attachment_list,
         }
 
 
@@ -299,6 +319,21 @@ def _build_qa_task_prompt(ctx: dict) -> str:
     feature_url = _extract_feature_url(ctx["site_url"], ctx["description"])
     target_url = feature_url or ctx["site_url"]
 
+    # Build attachments section
+    attachments_section = ""
+    if ctx.get("attachments"):
+        lines = []
+        for a in ctx["attachments"]:
+            size_kb = f"{a['size_bytes'] // 1024} KB" if a.get("size_bytes") else "unknown size"
+            lines.append(f"  - {a['filename']} ({size_kb}) → {a['download_url']}")
+        attachments_section = (
+            "\n\n## Attachments\n"
+            "The following files have been attached to this ticket. "
+            "You can fetch these URLs if they contain reference designs or requirements:\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
     return f"""You are the QA Agent for SiteDoc — a managed website maintenance service.
 Your job is to VISUALLY verify that the fix meets the customer's requirements using your browser.
 Do NOT rely on the dev agent's self-reported summary.
@@ -312,7 +347,7 @@ Do NOT rely on the dev agent's self-reported summary.
 ## Site
 {ctx["site_url"]}
 Target page: {target_url}
-
+{attachments_section}
 ## QA Instructions (follow in order)
 1. Open the browser and navigate to: {target_url}
 2. Take a screenshot of the page as it loads.

@@ -8,7 +8,7 @@ from enum import Enum as PyEnum
 
 from sqlalchemy import (
     Column, String, DateTime, ForeignKey, Text, Integer,
-    Float, Enum, BigInteger, func
+    Float, Enum, BigInteger, func, text as sa_text
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -37,6 +37,34 @@ class IssueStatus(PyEnum):
     pending_approval = "pending_approval"
     resolved = "resolved"
     dismissed = "dismissed"
+
+
+class KanbanColumn(PyEnum):
+    triage = "triage"
+    ready_for_uat_approval = "ready_for_uat_approval"
+    todo = "todo"
+    in_progress = "in_progress"
+    ready_for_qa = "ready_for_qa"
+    in_qa = "in_qa"
+    ready_for_uat = "ready_for_uat"
+    done = "done"
+    dismissed = "dismissed"
+
+
+class AgentRole(PyEnum):
+    pm = "pm"
+    dev = "dev"
+    qa = "qa"
+    tech_lead = "tech_lead"
+
+
+class TransitionActorType(PyEnum):
+    customer = "customer"
+    pm_agent = "pm_agent"
+    dev_agent = "dev_agent"
+    qa_agent = "qa_agent"
+    tech_lead = "tech_lead"
+    system = "system"
 
 
 class IssuePriority(PyEnum):
@@ -91,6 +119,8 @@ class Site(Base):
     name = Column(String(255), nullable=False)
     status = Column(Enum(SiteStatus, name="site_status", create_type=False), nullable=False, default=SiteStatus.active)
     last_health_check = Column(DateTime(timezone=True))
+    plugin_token = Column(String(128), unique=True, index=True)
+    plugin_version = Column(String(32))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     customer = relationship("Customer", back_populates="sites")
@@ -98,6 +128,7 @@ class Site(Base):
     issues = relationship("Issue", back_populates="site")
     conversations = relationship("Conversation", back_populates="site")
     backups = relationship("Backup", back_populates="site")
+    agents = relationship("SiteAgent", back_populates="site", cascade="all, delete-orphan")
 
 
 class SiteCredential(Base):
@@ -123,6 +154,13 @@ class Issue(Base):
     status = Column(Enum(IssueStatus, name="issue_status", create_type=False), nullable=False, default=IssueStatus.open)
     priority = Column(Enum(IssuePriority, name="issue_priority", create_type=False), nullable=False, default=IssuePriority.medium)
     confidence_score = Column(Float)
+    # Pipeline columns
+    kanban_column = Column(Enum(KanbanColumn, name="kanban_column", create_type=False), nullable=False, default=KanbanColumn.triage)
+    dev_fail_count = Column(Integer, nullable=False, default=0)
+    ticket_number = Column(BigInteger, server_default=sa_text("nextval('issues_ticket_number_seq')"))
+    pm_agent_id = Column(UUID(as_uuid=True), ForeignKey("site_agents.id", ondelete="SET NULL"))
+    dev_agent_id = Column(UUID(as_uuid=True), ForeignKey("site_agents.id", ondelete="SET NULL"))
+    stall_check_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     resolved_at = Column(DateTime(timezone=True))
 
@@ -130,6 +168,35 @@ class Issue(Base):
     customer = relationship("Customer", back_populates="issues")
     agent_actions = relationship("AgentAction", back_populates="issue", cascade="all, delete-orphan")
     chat_messages = relationship("ChatMessage", back_populates="issue", cascade="all, delete-orphan")
+    transitions = relationship("TicketTransition", back_populates="issue", cascade="all, delete-orphan")
+    attachments = relationship("TicketAttachment", back_populates="issue", cascade="all, delete-orphan")
+
+
+class SiteAgent(Base):
+    __tablename__ = "site_agents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    site_id = Column(UUID(as_uuid=True), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
+    agent_role = Column(String(20), nullable=False)
+    model = Column(String(100), nullable=False, default="claude-haiku-4-5")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    site = relationship("Site", back_populates="agents")
+
+
+class TicketTransition(Base):
+    __tablename__ = "ticket_transitions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    issue_id = Column(UUID(as_uuid=True), ForeignKey("issues.id", ondelete="CASCADE"), nullable=False)
+    from_col = Column(Enum(KanbanColumn, name="kanban_column", create_type=False))
+    to_col = Column(Enum(KanbanColumn, name="kanban_column", create_type=False), nullable=False)
+    actor_type = Column(String(20), nullable=False)
+    actor_id = Column(UUID(as_uuid=True))
+    note = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    issue = relationship("Issue", back_populates="transitions")
 
 
 class AgentAction(Base):
@@ -154,6 +221,7 @@ class ChatMessage(Base):
     issue_id = Column(UUID(as_uuid=True), ForeignKey("issues.id", ondelete="CASCADE"), nullable=False)
     sender_type = Column(Enum(SenderType, name="sender_type", create_type=False), nullable=False)
     content = Column(Text, nullable=False)
+    agent_role = Column(String(20))  # 'pm' | 'dev' | 'qa' | 'tech_lead' | None (user)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     issue = relationship("Issue", back_populates="chat_messages")
@@ -184,3 +252,18 @@ class Backup(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     site = relationship("Site", back_populates="backups")
+
+
+class TicketAttachment(Base):
+    __tablename__ = "ticket_attachments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    issue_id = Column(UUID(as_uuid=True), ForeignKey("issues.id", ondelete="CASCADE"), nullable=False)
+    filename = Column(String(255), nullable=False)       # original filename
+    stored_name = Column(String(255), nullable=False)    # UUID-based stored filename
+    mime_type = Column(String(100))
+    size_bytes = Column(Integer)
+    uploaded_by = Column(String, default="user")         # "user" or agent role
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    issue = relationship("Issue", back_populates="attachments")

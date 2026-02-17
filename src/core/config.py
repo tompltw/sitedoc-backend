@@ -15,6 +15,21 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     CREDENTIAL_ENCRYPTION_KEY: str = "changeme32byteskeyplaceholder123"
     ENVIRONMENT: str = "development"
+    CLAWBOT_BASE_URL: str = "http://localhost:18789/v1"
+    CLAWBOT_TOKEN: str = ""
+    CLAWBOT_AGENT_ID: str = "main"
+
+    # SMTP — email notifications (optional; leave SMTP_HOST empty to disable)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = "noreply@sitedoc.ai"
+    SMTP_TLS: bool = False       # True = SMTP_SSL (port 465)
+    SMTP_STARTTLS: bool = True   # True = STARTTLS (port 587)
+
+    # Frontend URL for email links
+    APP_URL: str = "http://localhost:3000"
 
 
 settings = Settings()

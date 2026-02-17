@@ -17,7 +17,7 @@ from src.api.schemas import (
     SiteResponse,
 )
 from src.core.config import settings
-from src.db.models import Customer, Site, SiteCredential
+from src.db.models import Customer, Site, SiteAgent, SiteCredential
 from src.db.session import get_db
 
 router = APIRouter()
@@ -68,6 +68,12 @@ async def create_site(
     db.add(site)
     await db.flush()
     await db.refresh(site)
+
+    # Auto-create default PM (Haiku) + Dev (Sonnet) agents for this site
+    db.add(SiteAgent(site_id=site.id, agent_role="pm", model="claude-haiku-4-5"))
+    db.add(SiteAgent(site_id=site.id, agent_role="dev", model="claude-sonnet-4-5"))
+    await db.flush()
+
     return site
 
 

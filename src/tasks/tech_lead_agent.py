@@ -14,8 +14,8 @@ import logging
 import os
 import uuid
 
-import httpx
 
+from src.tasks.llm import call_llm
 from src.tasks.base import (
     celery_app,
     get_db_session,
@@ -26,13 +26,6 @@ from src.tasks.base import (
 logger = logging.getLogger(__name__)
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://sitedoc:sitedoc@localhost:5432/sitedoc")
-CLAWBOT_AGENT_ID = os.getenv("CLAWBOT_AGENT_ID", "main")
-CLAWBOT_URL = os.getenv("CLAWBOT_BASE_URL", "http://127.0.0.1:18789/v1") + "/chat/completions"
-CLAWBOT_HEADERS = lambda: {
-    "Authorization": f"Bearer {os.getenv('CLAWBOT_TOKEN', '')}",
-    "Content-Type": "application/json",
-    "x-openclaw-agent-id": CLAWBOT_AGENT_ID,
-}
 
 TECH_LEAD_SYSTEM_PROMPT = """You are a senior tech lead and engineering manager at SiteDoc, \
 a managed website maintenance service. You have been escalated on a ticket where the dev agent \
@@ -161,21 +154,11 @@ def run(issue_id: str, reason: str = "") -> None:
         prompt = _build_tech_lead_prompt(ctx, reason or "Manual escalation")
 
         # 3. Call OpenClaw agent
-        resp = httpx.post(
-            CLAWBOT_URL,
-            headers=CLAWBOT_HEADERS(),
-            json={
-                "model": f"openclaw:{CLAWBOT_AGENT_ID}",
-                "max_tokens": 8096,
-                "messages": [
-                    {"role": "system", "content": TECH_LEAD_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            },
-            timeout=180.0,
-        )
-        resp.raise_for_status()
-        tl_response = resp.json()["choices"][0]["message"]["content"].strip()
+        tl_response = call_llm(
+            system_prompt=TECH_LEAD_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=180,
+        ).strip()
         logger.info("[tech_lead] Got response for issue %s (%d chars)", issue_id, len(tl_response))
 
         # 4. Post tech lead analysis
@@ -214,7 +197,7 @@ def _enqueue_dev_agent(issue_id: str) -> None:
         celery_app.send_task(
             "src.tasks.dev_agent.run",
             args=[issue_id],
-            queue="agent",
+            queue="backend",
         )
         logger.info("[tech_lead] Dev agent re-enqueued for issue %s", issue_id)
     except Exception as e:

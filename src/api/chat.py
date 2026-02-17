@@ -107,13 +107,6 @@ async def post_message(
 ):
     issue = await _get_issue_for_customer(issue_id, current_customer.id, db)
 
-    # Check if this is the first message — if so, enqueue the diagnose task
-    count_result = await db.execute(
-        select(func.count()).select_from(ChatMessage).where(ChatMessage.issue_id == issue_id)
-    )
-    message_count = count_result.scalar_one()
-    is_first_message = message_count == 0
-
     message = ChatMessage(
         issue_id=issue_id,
         sender_type=SenderType.user,
@@ -123,29 +116,19 @@ async def post_message(
     await db.flush()
     await db.refresh(message)
 
-    # Resolve conversation_id for memory extraction
-    # (conversation is site-scoped; use or create one)
-    conversation_id = await _get_or_create_conversation(
-        db=db,
-        site_id=issue.site_id,
-        customer_id=current_customer.id,
-    )
+    # Route to the correct agent based on kanban column
+    from src.db.models import KanbanColumn
+    kanban = issue.kanban_column if issue.kanban_column else KanbanColumn.triage
 
-    # Fire-and-forget: extract memory from this message (Layer 1 + Layer 2)
-    _enqueue_memory_extraction(
-        conversation_id=str(conversation_id),
-        customer_id=str(current_customer.id),
-        site_id=str(issue.site_id),
-        message_content=body.content,
-        message_id=str(message.id),
-        sender_type="user",
-    )
-
-    if is_first_message:
-        _enqueue_diagnose_task(issue_id=str(issue_id))
-
-    # Always enqueue chat reply for every user message
-    _enqueue_chat_reply(issue_id=str(issue_id), message_content=body.content)
+    if kanban in (KanbanColumn.triage, KanbanColumn.ready_for_uat_approval, KanbanColumn.ready_for_uat):
+        # PM agent handles customer messages during triage and approval stages
+        _enqueue_pm_agent(issue_id=str(issue_id), user_message=body.content)
+    elif kanban == KanbanColumn.in_progress:
+        # Dev agent handles messages while actively working
+        _enqueue_pm_agent(issue_id=str(issue_id), user_message=body.content)  # PM relays to customer
+    else:
+        # All other stages: PM agent handles general Q&A
+        _enqueue_pm_agent(issue_id=str(issue_id), user_message=body.content)
 
     return message
 
@@ -189,7 +172,7 @@ def _enqueue_memory_extraction(
     try:
         from celery import Celery
         import os
-        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
         celery_app.send_task(
             "src.tasks.memory_extraction.extract_message_memory",
             args=[conversation_id, customer_id, site_id, message_content, message_id],
@@ -212,7 +195,7 @@ def _enqueue_chat_reply(issue_id: str, message_content: str) -> None:
     try:
         from celery import Celery
         import os
-        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
         celery_app.send_task(
             "src.tasks.chat_reply.reply_to_user",
             args=[issue_id, message_content],
@@ -228,7 +211,7 @@ def _enqueue_diagnose_task(issue_id: str) -> None:
     try:
         from celery import Celery
         import os
-        celery_app = Celery(broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
         celery_app.send_task(
             "src.tasks.diagnose.diagnose_issue",
             args=[issue_id],
@@ -239,3 +222,17 @@ def _enqueue_diagnose_task(issue_id: str) -> None:
         logging.getLogger(__name__).warning(
             "Could not enqueue diagnose task for issue %s (Celery unavailable?)", issue_id
         )
+
+
+def _enqueue_pm_agent(issue_id: str, user_message: str) -> None:
+    """Fire-and-forget: route a user message to the PM agent task."""
+    try:
+        from src.tasks.base import celery_app
+        celery_app.send_task(
+            "src.tasks.pm_agent.handle_message",
+            args=[issue_id, user_message],
+            queue="backend",
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Could not enqueue pm_agent for issue %s", issue_id)
