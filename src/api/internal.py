@@ -67,9 +67,31 @@ async def agent_result(
 
     issue_id = body.issue_id
     logger.info(
-        "[internal] agent-result: issue=%s role=%s status=%s",
-        issue_id, body.agent_role, body.status,
+        "[internal] agent-result: issue=%s role=%s status=%s transition_to=%s",
+        issue_id, body.agent_role, body.status, body.transition_to,
     )
+
+    # Idempotency guard: if the issue has already been moved past in_progress,
+    # this is a duplicate callback from the same sub-agent — skip silently.
+    if body.transition_to:
+        try:
+            from src.db.models import Issue, KanbanColumn
+            from src.tasks.base import get_db_session
+
+            ALREADY_DONE_COLS = {
+                KanbanColumn.ready_for_qa, KanbanColumn.in_qa,
+                KanbanColumn.ready_for_uat, KanbanColumn.done, KanbanColumn.dismissed,
+            }
+            with get_db_session(DB_URL) as session:
+                issue = session.get(Issue, uuid.UUID(issue_id))
+                if issue and issue.kanban_column in ALREADY_DONE_COLS:
+                    logger.warning(
+                        "[internal] Duplicate callback for issue %s (already at %s) — skipping",
+                        issue_id, issue.kanban_column,
+                    )
+                    return {"ok": True, "skipped": "duplicate"}
+        except Exception as e:
+            logger.error("[internal] Idempotency check failed for issue %s: %s", issue_id, e)
 
     # 1. Post the result message to the issue chat
     prefix = "✅" if body.status == "success" else "❌"

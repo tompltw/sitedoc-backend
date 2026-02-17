@@ -209,7 +209,8 @@ def run(issue_id: str) -> None:
         logger.info("[dev_agent] Agent spawned for issue %s: %s", issue_id, result)
 
         # 5. Notify chat that agent is running
-        session_key = result.get("childSessionKey", "unknown")
+        details = result.get("details") or result  # /tools/invoke wraps in { details: {...} }
+        session_key = details.get("childSessionKey", "unknown")
         post_chat_message(
             issue_id,
             f"🤖 Dev agent is running (session: `{session_key}`). "
