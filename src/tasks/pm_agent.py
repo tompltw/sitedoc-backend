@@ -42,10 +42,10 @@ You communicate directly with the customer. Be concise and professional.
 To perform a ticket action, output a JSON block on its own line (it will be processed silently, not shown to the customer):
 
 Move ticket to a new stage:
-{"ticket_action": "transition", "to_col": "<column>"}
+{{"ticket_action": "transition", "to_col": "<column>"}}
 
 Confirm and create the ticket (moves to ready_for_uat_approval):
-{"ticket_confirmed": true, "title": "<short title>", "description": "<full structured description>"}
+{{"ticket_confirmed": true, "title": "<short title>", "description": "<full structured description>"}}
 
 Available columns: triage, ready_for_uat_approval, todo, in_progress, ready_for_qa, in_qa, ready_for_uat, done, dismissed
 
