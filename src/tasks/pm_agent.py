@@ -17,45 +17,69 @@ import re
 import uuid
 from typing import Optional
 
-import httpx
-
 from src.tasks.base import (
     celery_app,
     get_db_session,
     post_chat_message,
     transition_issue,
 )
+from src.tasks.llm import call_llm
 
 logger = logging.getLogger(__name__)
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://sitedoc:sitedoc@localhost:5432/sitedoc")
-CLAWBOT_AGENT_ID = os.getenv("CLAWBOT_AGENT_ID", "main")
-CLAWBOT_URL = os.getenv("CLAWBOT_BASE_URL", "http://127.0.0.1:18789/v1") + "/chat/completions"
-CLAWBOT_HEADERS = lambda: {
-    "Authorization": f"Bearer {os.getenv('CLAWBOT_TOKEN', '')}",
-    "Content-Type": "application/json",
-    "x-openclaw-agent-id": CLAWBOT_AGENT_ID,
-}
 
-PM_SYSTEM_PROMPT = """You are a helpful PM agent for SiteDoc, a website maintenance service. \
-Your job is to gather issue details from the customer so a dev agent can fix their site. \
-Be concise and professional.
+PM_SYSTEM_PROMPT_BASE = """You are a PM agent for SiteDoc, a managed website maintenance service.
+You communicate directly with the customer. Be concise and professional.
 
-You MUST collect ALL of the following before creating the ticket:
-1. A clear description of the issue
+## Critical rules
+- NEVER mention internal systems, dashboards, ticket IDs, API endpoints, or session keys to the customer.
+- NEVER ask the customer for information you already have (ticket ID, issue ID, etc.).
+- NEVER say you "can't reach" something — you always have full access to transition the ticket.
+- You CAN silently move the ticket to any stage without explaining the process to the customer.
+
+## Ticket actions
+To perform a ticket action, output a JSON block on its own line (it will be processed silently, not shown to the customer):
+
+Move ticket to a new stage:
+{"ticket_action": "transition", "to_col": "<column>"}
+
+Confirm and create the ticket (moves to ready_for_uat_approval):
+{"ticket_confirmed": true, "title": "<short title>", "description": "<full structured description>"}
+
+Available columns: triage, ready_for_uat_approval, todo, in_progress, ready_for_qa, in_qa, ready_for_uat, done, dismissed
+
+## Current ticket context
+Issue ID: {issue_id}
+Current stage: {kanban_column}
+SSH credentials on file: {has_ssh}
+
+## Triage stage behaviour
+Collect ALL of the following before confirming:
+1. Clear description of the issue
 2. Exact reproduction steps
-3. Expected behavior vs actual behavior
+3. Expected vs actual behaviour
+4. SSH credentials (only if NOT already on file)
 
-SSH credentials (if not already on file): if the customer's site has no SSH credentials stored, \
-you must ask for SSH host, username, and password.
+Once you have all details, confirm with the customer. When they confirm, emit the ticket_confirmed JSON.
 
-Once you have gathered all required details, confirm your understanding with the customer \
-("I understand you're seeing X — is that correct?"). When the customer confirms, output \
-a single JSON block on its own line in the following exact format:
+## Other stages
+If the customer asks about status or confirms work is done, check the current stage and respond accordingly.
+If work is complete and the customer confirms it, transition to 'done' using ticket_action JSON — do not ask the customer for any IDs."""
 
-{"ticket_confirmed": true, "title": "<short title>", "description": "<full structured description including steps, expected, actual>"}
 
-Do NOT output this JSON until the customer has confirmed all details are correct."""
+def _get_issue_context(issue_id: str, db_url: str) -> dict:
+    """Fetch current issue stage and relevant context for the system prompt."""
+    from src.db.models import Issue
+
+    with get_db_session(db_url) as session:
+        issue = session.get(Issue, uuid.UUID(issue_id))
+        if issue is None:
+            raise ValueError(f"Issue {issue_id} not found")
+        return {
+            "kanban_column": issue.kanban_column.value if issue.kanban_column else "triage",
+            "title": issue.title or "",
+        }
 
 
 def _get_chat_history(issue_id: str, db_url: str) -> list[dict]:
@@ -96,6 +120,32 @@ def _has_ssh_credentials(issue_id: str, db_url: str) -> bool:
             .first()
         )
         return cred is not None
+
+
+def _extract_transition_json(text: str) -> Optional[str]:
+    """
+    Look for a {"ticket_action": "transition", "to_col": "..."} block in the agent reply.
+    Returns the target column string or None.
+    """
+    pattern = r'\{[^{}]*"ticket_action"\s*:\s*"transition"[^{}]*\}'
+    matches = re.findall(pattern, text, re.DOTALL)
+    for raw in matches:
+        try:
+            data = json.loads(raw)
+            if data.get("ticket_action") == "transition" and data.get("to_col"):
+                return data["to_col"]
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _strip_json_blocks(text: str) -> str:
+    """Remove internal JSON action blocks from agent reply before showing to customer."""
+    # Remove ticket_action blocks
+    text = re.sub(r'\{[^{}]*"ticket_action"[^{}]*\}\n?', '', text)
+    # Remove ticket_confirmed blocks
+    text = re.sub(r'\{[^{}]*"ticket_confirmed"[^{}]*\}\n?', '', text)
+    return text.strip()
 
 
 def _extract_ticket_json(text: str) -> Optional[dict]:
@@ -140,42 +190,49 @@ def handle_message(issue_id: str, user_message: str) -> None:
     logger.info("[pm_agent] Handling message for issue %s", issue_id)
 
     try:
-        # 1. Fetch existing conversation history (excluding the incoming message, which isn't
-        #    persisted yet from the agent's perspective)
+        # 1. Fetch existing conversation history
         history = _get_chat_history(issue_id, DB_URL)
 
-        # 2. Determine if SSH creds are available and include a hint in the system prompt
+        # 2. Fetch issue context + SSH status for the system prompt
+        issue_ctx = _get_issue_context(issue_id, DB_URL)
         has_ssh = _has_ssh_credentials(issue_id, DB_URL)
-        system_prompt = PM_SYSTEM_PROMPT
-        if not has_ssh:
-            system_prompt += (
-                "\n\nIMPORTANT: This site does NOT have SSH credentials on file. "
-                "You MUST ask the customer for their SSH host, username, and password "
-                "before the ticket can be worked on."
-            )
+
+        system_prompt = PM_SYSTEM_PROMPT_BASE.format(
+            issue_id=issue_id,
+            kanban_column=issue_ctx["kanban_column"],
+            has_ssh="yes" if has_ssh else "no",
+        )
 
         # 3. Build messages list — history + new user message
         messages = history + [{"role": "user", "content": user_message}]
 
-        # 4. Call OpenClaw agent
-        resp = httpx.post(
-            CLAWBOT_URL,
-            headers=CLAWBOT_HEADERS(),
-            json={
-                "model": f"openclaw:{CLAWBOT_AGENT_ID}",
-                "max_tokens": 1024,
-                "messages": [{"role": "system", "content": system_prompt}] + messages,
-            },
-            timeout=120.0,
-        )
-        resp.raise_for_status()
-        agent_reply = resp.json()["choices"][0]["message"]["content"].strip()
+        # 4. Call OpenClaw agent via gateway
+        agent_reply = call_llm(
+            system_prompt=system_prompt,
+            messages=messages,
+        ).strip()
         logger.info("[pm_agent] Got reply for issue %s (%d chars)", issue_id, len(agent_reply))
 
-        # 5. Post agent reply to DB + WS
-        post_chat_message(issue_id, agent_reply, "pm", DB_URL)
+        # 5. Strip internal JSON blocks before posting to customer
+        visible_reply = _strip_json_blocks(agent_reply)
+        if visible_reply:
+            post_chat_message(issue_id, visible_reply, "pm", DB_URL)
 
-        # 6. Check for ticket confirmation JSON
+        # 6. Handle ticket_action transition (silent — not shown to customer)
+        to_col = _extract_transition_json(agent_reply)
+        if to_col:
+            logger.info("[pm_agent] Transitioning issue %s → %s (ticket_action)", issue_id, to_col)
+            try:
+                transition_issue(
+                    issue_id=issue_id,
+                    to_col=to_col,
+                    actor_type="pm_agent",
+                    note=f"PM agent transitioned ticket to {to_col}.",
+                )
+            except Exception as te:
+                logger.error("[pm_agent] ticket_action transition failed for %s → %s: %s", issue_id, to_col, te)
+
+        # 7. Check for ticket confirmation JSON
         ticket_data = _extract_ticket_json(agent_reply)
         if ticket_data:
             title = ticket_data.get("title", "Untitled Issue")
@@ -192,17 +249,9 @@ def handle_message(issue_id: str, user_message: str) -> None:
                     to_col="ready_for_uat_approval",
                     actor_type="pm_agent",
                     note="PM agent confirmed ticket details with customer.",
-                    db_url=DB_URL,
                 )
             except Exception as te:
                 logger.error("[pm_agent] Transition failed for issue %s: %s", issue_id, te)
-                post_chat_message(
-                    issue_id,
-                    "⚠️ I've confirmed the ticket details but had trouble updating the ticket stage. "
-                    "Our team will follow up shortly.",
-                    "pm",
-                    DB_URL,
-                )
 
     except Exception as e:
         logger.exception("[pm_agent] Unhandled error for issue %s: %s", issue_id, e)
