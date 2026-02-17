@@ -46,6 +46,10 @@ CREDENTIAL_PATTERNS = {
 
 
 def _get_fernet() -> Fernet:
+    # NOTE: Fernet symmetric encryption is fine for MVP.
+    # Production: swap to HashiCorp Vault Transit Engine for envelope encryption
+    # + automatic key rotation without re-encrypting all stored credentials.
+    # See: https://developer.hashicorp.com/vault/docs/secrets/transit
     key_raw = os.getenv("CREDENTIAL_ENCRYPTION_KEY", "placeholder-change-in-prod")
     key = base64.urlsafe_b64encode(key_raw.encode().ljust(32)[:32])
     return Fernet(key)
