@@ -12,7 +12,7 @@ import uuid
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel
 
-from src.tasks.base import post_chat_message, transition_issue
+from src.tasks.base import post_chat_message, transition_issue_direct
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +106,12 @@ async def agent_result(
     # 2. Advance the ticket if a target column was specified
     if body.transition_to:
         try:
-            transition_issue(
+            transition_issue_direct(
                 issue_id=issue_id,
                 to_col=body.transition_to,
                 actor_type=f"{body.agent_role}_agent",
                 note=f"Agent {body.status}: advanced to {body.transition_to}",
+                db_url=DB_URL,
             )
         except Exception as e:
             logger.error("[internal] Failed to transition issue %s → %s: %s", issue_id, body.transition_to, e)
