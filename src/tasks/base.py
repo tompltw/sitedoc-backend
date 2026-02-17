@@ -44,9 +44,9 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     beat_schedule={
-        "stall-checker-every-15min": {
+        "stall-checker-every-5min": {
             "task": "src.tasks.stall_checker.check_stalled_tickets",
-            "schedule": 15 * 60,  # every 15 minutes
+            "schedule": 5 * 60,  # every 5 minutes
         },
     },
 )
