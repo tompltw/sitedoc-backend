@@ -15,6 +15,59 @@ from src.db.session import get_db
 router = APIRouter()
 
 
+@router.get("/issues/{issue_id}/context")
+async def get_conversation_context(
+    issue_id: uuid.UUID,
+    current_customer: Customer = Depends(get_current_customer),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Debug endpoint — returns the assembled hybrid context the agent would see
+    for this issue's conversation. Useful for frontend context debug view.
+    """
+    from sqlalchemy import text
+    from src.services.memory_extractor import assemble_context
+
+    # Verify issue belongs to customer
+    result = await db.execute(
+        select(Issue).where(Issue.id == issue_id, Issue.customer_id == current_customer.id)
+    )
+    issue = result.scalar_one_or_none()
+    if issue is None:
+        raise HTTPException(status_code=404, detail="Issue not found")
+
+    # Get conversation for this site
+    conv_result = await db.execute(
+        text("""
+            SELECT id FROM conversations
+            WHERE site_id = :site_id AND customer_id = :customer_id
+            ORDER BY updated_at DESC LIMIT 1
+        """),
+        {"site_id": str(issue.site_id), "customer_id": str(current_customer.id)}
+    )
+    conv_row = conv_result.fetchone()
+
+    if not conv_row:
+        return {
+            "structured_memory": {"credentials": [], "tasks": [], "decisions": [], "preferences": [], "file_urls": []},
+            "recent_messages": [],
+            "rag_results": [],
+            "token_estimate": 0,
+            "conversation_id": None,
+        }
+
+    context = await assemble_context(
+        db=db,
+        conversation_id=uuid.UUID(str(conv_row[0])),
+        customer_id=current_customer.id,
+        current_message="",
+        recent_n=5,
+        rag_top_k=5,
+    )
+    context["conversation_id"] = str(conv_row[0])
+    return context
+
+
 async def _get_issue_for_customer(
     issue_id: uuid.UUID,
     customer_id: uuid.UUID,
