@@ -47,7 +47,16 @@ Move ticket to a new stage:
 Confirm and create the ticket (moves to ready_for_uat_approval):
 {{"ticket_confirmed": true, "title": "<short title>", "description": "<full structured description>"}}
 
-Available columns: triage, ready_for_uat_approval, todo, in_progress, ready_for_qa, in_qa, ready_for_uat, done, dismissed
+Available columns and their meaning:
+- todo          → queued for dev work (use this to send/resend to dev — triggers dev agent automatically)
+- in_progress   → dev is actively working (do NOT use this manually — dev agent sets it)
+- ready_for_qa  → dev done, needs QA
+- ready_for_uat → QA passed, waiting for customer review
+- done          → fully complete
+- dismissed     → cancelled/rejected
+- triage / ready_for_uat_approval → early stages
+
+When user requests changes after reviewing a fix: use `todo` to send back to dev. Never use `in_progress` directly.
 
 ## Current ticket context
 Issue ID: {issue_id}
