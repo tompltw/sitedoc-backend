@@ -41,18 +41,22 @@ Return ONLY valid JSON in this exact format:
       "category": "credential",
       "payload": {
         "type": "wordpress|ssh|ftp|api_key|other",
-        "url": "...",
-        "username": "...",
-        "password": "...",
-        "notes": "..."
+        "host": "hostname or URL (non-sensitive)",
+        "username": "username or user (non-sensitive)",
+        "password": "[DETECTED]",
+        "token": "[DETECTED]",
+        "key": "[DETECTED]",
+        "vault_ref": null,
+        "notes": "any non-sensitive context"
       }
     },
     {
       "category": "task",
       "payload": {
-        "description": "...",
-        "priority": "low|medium|high",
-        "target": "url or site reference"
+        "action": "short verb phrase",
+        "target": "url or site reference",
+        "priority": "low|normal|high",
+        "status": "pending"
       }
     },
     {
@@ -60,15 +64,14 @@ Return ONLY valid JSON in this exact format:
       "payload": {
         "key": "short_key_snake_case",
         "value": "...",
-        "description": "..."
+        "context": "why this decision was made"
       }
     },
     {
       "category": "preference",
       "payload": {
         "key": "short_key_snake_case",
-        "value": "...",
-        "description": "..."
+        "value": "..."
       }
     },
     {
@@ -76,7 +79,7 @@ Return ONLY valid JSON in this exact format:
       "payload": {
         "url": "...",
         "type": "repo|page|file|doc|other",
-        "description": "..."
+        "label": "short description"
       }
     }
   ]
@@ -85,11 +88,14 @@ Return ONLY valid JSON in this exact format:
 Rules:
 - Only extract categories present in the message
 - credentials: logins, API keys, tokens, passwords, SSH details
-- tasks: explicit requests to fix/build/change something
+  *** CRITICAL: Replace ALL sensitive values (passwords, tokens, keys, secrets) with "[DETECTED]" ***
+  *** NEVER output the actual password/token/key value — only detect and classify ***
+  *** Only username, host/url, and type are safe to store verbatim ***
+- tasks: explicit requests to fix/build/change something; priority defaults to "normal"
 - decisions: choices made (theme colors, tech stack, approach)
 - preferences: always/never rules, coding style, tooling choices
 - file_url: links, repo URLs, page references
-- If nothing extractable, return {"categories": ["general"], "extractions": []}
+- If nothing extractable: {"categories": ["general"], "extractions": []}
 - Be conservative — only extract what's clearly stated"""
 
 
@@ -143,7 +149,7 @@ async def extract_and_store(
             if not payload:
                 continue
 
-            await db.execute(
+            result_insert = await db.execute(
                 text("""
                     INSERT INTO conversation_memory
                         (conversation_id, customer_id, site_id, category, payload,
@@ -151,6 +157,7 @@ async def extract_and_store(
                     VALUES
                         (:conversation_id, :customer_id, :site_id, :category, :payload::jsonb,
                          :source_message_id, 'haiku')
+                    RETURNING id
                 """),
                 {
                     "conversation_id": str(conversation_id),
@@ -161,7 +168,30 @@ async def extract_and_store(
                     "source_message_id": str(message_id) if message_id else None,
                 }
             )
+            memory_row_id = result_insert.scalar_one()
             stored += 1
+
+            # If Haiku detected a credential, hand off to secure handler immediately
+            # The handler re-reads the raw message, extracts actual value, encrypts it
+            # Raw values NEVER enter conversation_memory or logs
+            if category == "credential" and site_id and (
+                payload.get("password") == "[DETECTED]"
+                or payload.get("token") == "[DETECTED]"
+                or payload.get("key") == "[DETECTED]"
+            ):
+                try:
+                    from src.services.credential_handler import handle_detected_credential
+                    await handle_detected_credential(
+                        db=db,
+                        raw_message=message_content,
+                        memory_row_id=UUID(str(memory_row_id)),
+                        site_id=site_id,
+                        customer_id=customer_id,
+                        haiku_payload=payload,
+                    )
+                except Exception as e:
+                    logger.error("Credential secure handler failed: %s", e, exc_info=True)
+                    # Don't fail the whole extraction — just log and continue
 
         await db.commit()
 
