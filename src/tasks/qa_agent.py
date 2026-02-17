@@ -20,9 +20,9 @@ import re
 import uuid
 from typing import Optional
 
-import httpx
 import requests
 
+from src.tasks.llm import call_llm
 from src.tasks.base import (
     celery_app,
     get_db_session,
@@ -33,25 +33,25 @@ from src.tasks.base import (
 logger = logging.getLogger(__name__)
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://sitedoc:sitedoc@localhost:5432/sitedoc")
-CLAWBOT_AGENT_ID = os.getenv("CLAWBOT_AGENT_ID", "main")
-CLAWBOT_URL = os.getenv("CLAWBOT_BASE_URL", "http://127.0.0.1:18789/v1") + "/chat/completions"
-CLAWBOT_HEADERS = lambda: {
-    "Authorization": f"Bearer {os.getenv('CLAWBOT_TOKEN', '')}",
-    "Content-Type": "application/json",
-    "x-openclaw-agent-id": CLAWBOT_AGENT_ID,
-}
 
-QA_SYSTEM_PROMPT = """You are a QA engineer verifying whether a website fix was successful. \
+QA_SYSTEM_PROMPT = """You are a strict QA engineer verifying whether a website fix fully meets the original requirements.
+
 You will be given:
-- The original issue description reported by the customer
-- The fix applied by the dev agent
-- The HTTP status returned by the site
+- The original issue description (the customer's requirements — this is the source of truth)
+- The fix summary reported by the dev agent
+- The HTTP status and page HTML/content from the live site
 
-Evaluate whether the fix appears to have resolved the issue based on this information.
+Your job:
+1. Extract every specific requirement from the issue description.
+2. For EACH requirement, check whether the live page HTML/content satisfies it.
+3. Do NOT just trust the dev agent's summary — verify against the actual page content.
+4. Pay close attention to ORDER and LAYOUT requirements (e.g. "below the form" means the element must appear AFTER the form in the HTML, not before).
+5. If ANY requirement is unmet, return passed=false.
+
 Respond ONLY with a JSON object in this exact format (no other text):
-{"passed": true, "reason": "brief explanation"}
+{"passed": true, "reason": "brief explanation of what was verified"}
 or
-{"passed": false, "reason": "brief explanation of what still seems wrong"}"""
+{"passed": false, "reason": "specific requirement that failed and what was found instead"}"""
 
 
 def _fetch_qa_context(issue_id: str, db_url: str) -> dict:
@@ -89,24 +89,42 @@ def _fetch_qa_context(issue_id: str, db_url: str) -> dict:
         }
 
 
-def _http_check(site_url: str) -> tuple[int, str]:
+def _http_check(site_url: str) -> tuple[int, str, str]:
     """
-    Perform a basic HTTP GET on the site URL.
-    Returns (status_code, summary_string).
+    Perform a basic HTTP GET on the site URL and return the page HTML.
+    Falls back to HTTP if HTTPS fails with an SSL/connection error.
+    Returns (status_code, summary_string, page_html).
     """
     if not site_url:
-        return 0, "No site URL configured"
-    try:
-        resp = requests.get(site_url, timeout=15, allow_redirects=True)
-        return resp.status_code, f"HTTP {resp.status_code}"
-    except requests.exceptions.SSLError:
-        return 0, "SSL error"
-    except requests.exceptions.ConnectionError:
-        return 0, "Connection refused / DNS failure"
-    except requests.exceptions.Timeout:
-        return 408, "Request timed out"
-    except Exception as e:
-        return 0, f"Error: {str(e)[:100]}"
+        return 0, "No site URL configured", ""
+
+    def _try(url: str) -> tuple[int, str, str]:
+        try:
+            resp = requests.get(url, timeout=15, allow_redirects=True, verify=False)
+            # Truncate HTML to 8000 chars to keep LLM context manageable
+            html = resp.text[:8000] if resp.text else ""
+            return resp.status_code, f"HTTP {resp.status_code}", html
+        except requests.exceptions.SSLError:
+            return None, "SSL error", ""
+        except requests.exceptions.ConnectionError:
+            return None, "Connection refused / DNS failure", ""
+        except requests.exceptions.Timeout:
+            return 408, "Request timed out", ""
+        except Exception as e:
+            return None, f"Error: {str(e)[:100]}", ""
+
+    status, msg, html = _try(site_url)
+    if status is not None:
+        return status, msg, html
+
+    # If HTTPS failed, retry with HTTP
+    if site_url.startswith("https://"):
+        http_url = site_url.replace("https://", "http://", 1)
+        status2, msg2, html2 = _try(http_url)
+        if status2 is not None:
+            return status2, f"{msg2} (via HTTP fallback)", html2
+
+    return 0, msg, ""
 
 
 def _parse_qa_result(text: str) -> Optional[dict]:
@@ -114,22 +132,21 @@ def _parse_qa_result(text: str) -> Optional[dict]:
     Extract the JSON QA result from the model's response.
     Returns dict with 'passed' and 'reason', or None on parse failure.
     """
-    # Try to find a JSON object in the response
-    pattern = r'\{[^{}]*"passed"\s*:\s*(true|false)[^{}]*\}'
-    matches = re.findall(pattern, text, re.DOTALL)
-    for raw in matches:
+    # Try to find a JSON object in the response (non-capturing group)
+    pattern = r'\{[^{}]*"passed"\s*:\s*(?:true|false)[^{}]*\}'
+    for match in re.finditer(pattern, text, re.DOTALL):
         try:
-            data = json.loads(raw)
-            if "passed" in data:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict) and "passed" in data:
                 return data
         except json.JSONDecodeError:
             continue
     # Fallback: try parsing the whole response as JSON
     try:
         data = json.loads(text.strip())
-        if "passed" in data:
+        if isinstance(data, dict) and "passed" in data:
             return data
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         pass
     return None
 
@@ -163,33 +180,24 @@ def run(issue_id: str) -> None:
         # 3. Fetch context
         ctx = _fetch_qa_context(issue_id, DB_URL)
 
-        # 4. HTTP check
-        http_status, http_summary = _http_check(ctx["site_url"])
+        # 4. HTTP check — fetch page HTML for real verification
+        http_status, http_summary, page_html = _http_check(ctx["site_url"])
         logger.info("[qa_agent] Site %s returned %s", ctx["site_url"], http_summary)
 
-        # 5. Call OpenClaw agent
+        # 5. Call OpenClaw agent with actual page content
         qa_prompt = (
-            f"Issue reported by customer:\n{ctx['description']}\n\n"
-            f"Fix applied by dev agent:\n{ctx['last_dev_message']}\n\n"
-            f"HTTP check result: {http_summary} (status code: {http_status})\n\n"
-            f"Does this issue appear to be resolved?"
+            f"## Original customer requirements\n{ctx['description']}\n\n"
+            f"## Dev agent fix summary\n{ctx['last_dev_message']}\n\n"
+            f"## Live site HTTP check\nStatus: {http_summary} ({http_status})\n\n"
+            f"## Live page HTML (first 8000 chars)\n{page_html}\n\n"
+            f"Verify each requirement against the live HTML above. "
+            f"Pay special attention to the ORDER elements appear in the HTML."
         )
 
-        resp = httpx.post(
-            CLAWBOT_URL,
-            headers=CLAWBOT_HEADERS(),
-            json={
-                "model": f"openclaw:{CLAWBOT_AGENT_ID}",
-                "max_tokens": 512,
-                "messages": [
-                    {"role": "system", "content": QA_SYSTEM_PROMPT},
-                    {"role": "user", "content": qa_prompt},
-                ],
-            },
-            timeout=120.0,
-        )
-        resp.raise_for_status()
-        qa_response_text = resp.json()["choices"][0]["message"]["content"].strip()
+        qa_response_text = call_llm(
+            system_prompt=QA_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": qa_prompt}],
+        ).strip()
         logger.info("[qa_agent] QA response for issue %s: %s", issue_id, qa_response_text[:200])
 
         # 6. Parse result
@@ -265,7 +273,7 @@ def _enqueue_dev_agent(issue_id: str) -> None:
         celery_app.send_task(
             "src.tasks.dev_agent.run",
             args=[issue_id],
-            queue="agent",
+            queue="backend",
         )
         logger.info("[qa_agent] Re-enqueued dev_agent for issue %s", issue_id)
     except Exception as e:
