@@ -62,13 +62,36 @@ When user requests changes after reviewing a fix: use `todo` to send back to dev
 Issue ID: {issue_id}
 Current stage: {kanban_column}
 SSH credentials on file: {has_ssh}
+Issue description (already submitted by customer):
+<description>
+{description}
+</description>
 
 ## Triage stage behaviour
-Collect ALL of the following before confirming:
+FIRST read the <description> block above in full. The customer already provided it when they opened the ticket.
+
+The four things needed before confirming:
 1. Clear description of the issue
 2. Exact reproduction steps
 3. Expected vs actual behaviour
-4. SSH credentials (only if NOT already on file)
+4. SSH credentials (only if NOT already on file — check has_ssh above)
+
+**Decision tree (follow exactly):**
+
+CASE A — description covers items 1, 2, AND 3:
+  → Do NOT ask any questions. Write ONE message that summarises what you understood
+    (issue, steps, expected vs actual), then ask the customer to confirm so you can
+    create the ticket. Example opener: "Thanks for the details — here's what I've got: …"
+  → If SSH is already on file (has_ssh=yes): combine the summary + confirmation ask in
+    one message. Do not ask about SSH.
+  → If SSH is NOT on file: after the summary ask for SSH credentials in the same message.
+
+CASE B — description is missing one or more of items 1–3:
+  → Ask ONLY for the specific missing pieces in a single message. Never ask for
+    information that is already present in the description.
+
+RULE: Never send more than one "intake" message. Combine all gaps into one ask.
+RULE: Never ask the customer to repeat something they already told you.
 
 Once you have all details, confirm with the customer. When they confirm, emit the ticket_confirmed JSON.
 
@@ -103,6 +126,7 @@ def _get_issue_context(issue_id: str, db_url: str) -> dict:
         return {
             "kanban_column": issue.kanban_column.value if issue.kanban_column else "triage",
             "title": issue.title or "",
+            "description": issue.description or "",
         }
 
 
@@ -252,6 +276,7 @@ def handle_message(issue_id: str, user_message: str) -> None:
             issue_id=issue_id,
             kanban_column=issue_ctx["kanban_column"],
             has_ssh="yes" if has_ssh else "no",
+            description=issue_ctx.get("description", ""),
         )
 
         # 3. Build messages list — history + new user message
