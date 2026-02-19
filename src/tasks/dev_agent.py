@@ -279,7 +279,7 @@ Site: {ctx["site_name"]} ({ctx["site_url"]})
    - Take a screenshot and visually confirm the fix matches the requirements exactly
    - Check layout (left/right position, above/below order), content, and behaviour
    - Do NOT self-report success based on reading your own code — verify by seeing it in the browser
-5. When finished (and only after visual confirmation), call the callback below.
+5. When finished (and only after visual confirmation), call the callback below, then close the browser to free memory.
 
 ## Callback (REQUIRED — call this when done)
 POST {callback_url}

@@ -396,6 +396,8 @@ Body if QA FAILED:
 }}
 
 Start the browser now and verify visually.
+
+**After calling the callback, close the browser to free memory.**
 """
 
 
