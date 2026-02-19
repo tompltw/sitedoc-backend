@@ -245,6 +245,43 @@ def transition_issue_direct(
             logger.error("[base] Could not enqueue qa_agent for %s: %s", issue_id, e)
 
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+
+def try_acquire_agent_lock(issue_id: str, agent_role: str, ttl_seconds: int = 900) -> bool:
+    """
+    Try to acquire a Redis lock for (agent_role, issue_id).
+
+    Uses SET NX EX so only the first caller succeeds — any concurrent duplicate
+    Celery task for the same issue will see the lock already held and abort.
+
+    The lock expires automatically after ttl_seconds (default 15 min, matching
+    the agent run timeout) so a crashed task can always be retried.
+
+    Returns True if the lock was acquired, False if it was already held.
+    """
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(REDIS_URL, decode_responses=True)
+        key = f"agent_lock:{agent_role}:{issue_id}"
+        return bool(r.set(key, "1", nx=True, ex=ttl_seconds))
+    except Exception as e:
+        # If Redis is unavailable, log and allow the task to proceed so we
+        # don't block all work — the pre-flight column check is still a backstop.
+        logger.warning("[base] Could not check agent lock for %s/%s: %s — proceeding", agent_role, issue_id, e)
+        return True
+
+
+def release_agent_lock(issue_id: str, agent_role: str) -> None:
+    """Release the agent lock early (e.g. called from the agent-result callback)."""
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(REDIS_URL, decode_responses=True)
+        r.delete(f"agent_lock:{agent_role}:{issue_id}")
+    except Exception as e:
+        logger.warning("[base] Could not release agent lock for %s/%s: %s", agent_role, issue_id, e)
+
+
 def get_issue(issue_id: str, db_url: str):
     """
     Fetch and return a detached Issue ORM object from the database.

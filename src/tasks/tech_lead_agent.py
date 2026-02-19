@@ -10,11 +10,13 @@ Flow:
   4. Post tech lead response (agent_role='tech_lead').
   5. Transition to in_progress, re-enqueue dev_agent with guidance.
 """
+import json
 import logging
 import os
 import uuid
 
-
+from src.db.models import AgentAction, ActionStatus
+from src.services.notifications import notify_admin_failure
 from src.tasks.llm import call_llm
 from src.tasks.base import (
     celery_app,
@@ -180,6 +182,19 @@ def run(issue_id: str, reason: str = "") -> None:
 
     except Exception as e:
         logger.exception("[tech_lead] Unhandled error for issue %s: %s", issue_id, e)
+        try:
+            with get_db_session(DB_URL) as session:
+                session.add(AgentAction(
+                    issue_id=uuid.UUID(issue_id),
+                    action_type="agent_failure",
+                    description="tech_lead_agent unhandled error",
+                    status=ActionStatus.failed,
+                    before_state=json.dumps({"error": str(e)[:500], "error_type": type(e).__name__}),
+                ))
+                session.commit()
+        except Exception:
+            pass
+        notify_admin_failure(issue_id, "tech_lead", type(e).__name__, str(e)[:300])
         try:
             post_chat_message(
                 issue_id,

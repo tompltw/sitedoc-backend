@@ -31,5 +31,8 @@ class Settings(BaseSettings):
     # Frontend URL for email links
     APP_URL: str = "http://localhost:3000"
 
+    # Admin alert email — receives agent failure notifications (override via env var)
+    ADMIN_ALERT_EMAIL: str = "saleturnkey@gmail.com"
+
 
 settings = Settings()

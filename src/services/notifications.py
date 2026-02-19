@@ -221,6 +221,39 @@ def notify_approval_needed(
     )
 
 
+def notify_admin_failure(
+    issue_id: str,
+    agent_role: str,
+    error_type: str,
+    error_detail: str,
+) -> bool:
+    """Alert admin when an agent task throws an unhandled exception."""
+    admin_email = settings.ADMIN_ALERT_EMAIL
+    if not admin_email:
+        logger.debug("ADMIN_ALERT_EMAIL not configured — skipping admin failure alert")
+        return False
+
+    issue_url = f"{settings.APP_URL}/issues/{issue_id}"
+    subject = f"[SiteDoc] ⚠️ Agent failure: {agent_role} / {error_type}"
+    html = f"""
+    <div style="font-family: sans-serif; max-width: 600px;">
+      <h2 style="color:#dc2626;">⚠️ Agent Failure — {agent_role}</h2>
+      <table style="width:100%; border-collapse:collapse; margin:12px 0;">
+        <tr><td style="padding:6px; background:#f1f5f9; font-weight:bold;">Issue</td>
+            <td style="padding:6px;"><a href="{issue_url}">{issue_id}</a></td></tr>
+        <tr><td style="padding:6px; background:#f1f5f9; font-weight:bold;">Agent</td>
+            <td style="padding:6px;">{agent_role}</td></tr>
+        <tr><td style="padding:6px; background:#f1f5f9; font-weight:bold;">Error type</td>
+            <td style="padding:6px;">{error_type}</td></tr>
+      </table>
+      <pre style="background:#fef2f2; border-left:4px solid #dc2626; padding:12px; font-size:12px; white-space:pre-wrap;">{error_detail}</pre>
+      <a href="{issue_url}" style="display:inline-block; padding:10px 20px; background:#2563eb; color:white; border-radius:6px; text-decoration:none; margin-top:8px;">View Issue →</a>
+    </div>
+    """
+    text = f"Agent failure\nIssue: {issue_url}\nAgent: {agent_role}\nError: {error_type}\n{error_detail}"
+    return _send_email(to=admin_email, subject=subject, html=html, text=text)
+
+
 def notify_health_alert(
     to_email: str,
     customer_name: str,

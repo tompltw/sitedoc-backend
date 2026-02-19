@@ -12,7 +12,7 @@ import uuid
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel
 
-from src.tasks.base import post_chat_message, transition_issue_direct
+from src.tasks.base import post_chat_message, release_agent_lock, transition_issue_direct
 
 logger = logging.getLogger(__name__)
 
@@ -148,24 +148,36 @@ async def agent_result(
         issue_id, body.agent_role, body.status, body.transition_to,
     )
 
-    # Idempotency guard: if the issue has already been moved past in_progress,
-    # this is a duplicate callback from the same sub-agent — skip silently.
+    # Idempotency guard: skip if the target column is same or earlier in the pipeline.
+    # This prevents backwards transitions (e.g. ready_for_qa when already in_qa)
+    # and duplicate callbacks from re-running completed stages.
     if body.transition_to:
         try:
-            from src.db.models import Issue, KanbanColumn
+            from src.db.models import Issue
             from src.tasks.base import get_db_session
 
-            ALREADY_DONE_COLS = {
-                KanbanColumn.ready_for_uat, KanbanColumn.done, KanbanColumn.dismissed,
-            }
+            PIPELINE_ORDER = [
+                "triage", "ready_for_uat_approval", "todo", "in_progress",
+                "ready_for_qa", "in_qa", "ready_for_uat", "done", "dismissed",
+            ]
+
+            def _col_idx(val: str) -> int:
+                try:
+                    return PIPELINE_ORDER.index(val)
+                except ValueError:
+                    return -1
+
             with get_db_session(DB_URL) as session:
                 issue = session.get(Issue, uuid.UUID(issue_id))
-                if issue and issue.kanban_column in ALREADY_DONE_COLS:
-                    logger.warning(
-                        "[internal] Duplicate callback for issue %s (already at %s) — skipping",
-                        issue_id, issue.kanban_column,
-                    )
-                    return {"ok": True, "skipped": "duplicate"}
+                if issue:
+                    current_idx = _col_idx(issue.kanban_column.value if issue.kanban_column else "")
+                    target_idx  = _col_idx(body.transition_to)
+                    if target_idx >= 0 and current_idx >= target_idx:
+                        logger.warning(
+                            "[internal] Skipping callback for %s — already at '%s', target '%s' is same or earlier",
+                            issue_id, issue.kanban_column, body.transition_to,
+                        )
+                        return {"ok": True, "skipped": "already_at_or_past_target"}
         except Exception as e:
             logger.error("[internal] Idempotency check failed for issue %s: %s", issue_id, e)
 
@@ -194,13 +206,11 @@ async def agent_result(
             # Don't fail the whole request — message was already posted
             return {"ok": True, "warning": f"Message posted but transition failed: {e}"}
 
-        # 3. Enqueue next agent if moving to ready_for_qa
-        if body.transition_to == "ready_for_qa" and body.status == "success":
-            try:
-                from src.tasks.base import celery_app
-                celery_app.send_task("src.tasks.qa_agent.run", args=[issue_id], queue="backend")
-                logger.info("[internal] QA agent enqueued for issue %s", issue_id)
-            except Exception as e:
-                logger.error("[internal] Failed to enqueue QA agent for issue %s: %s", issue_id, e)
+    # Release the agent lock so the next run (retry or new stage) can proceed immediately.
+    # agent_role from the callback is "dev" or "qa" — matches the lock keys set in those tasks.
+    release_agent_lock(issue_id, body.agent_role)
+
+    # Note: dev/qa agent enqueuing is handled inside transition_issue_direct()
+    # (base.py) to keep dispatch logic in one place and avoid double-enqueue.
 
     return {"ok": True}
