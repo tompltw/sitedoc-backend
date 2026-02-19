@@ -13,6 +13,7 @@ Flow (non-blocking):
      POST /api/v1/internal/agent-result when done.
 """
 import base64
+import json
 import logging
 import os
 import uuid
@@ -37,12 +38,14 @@ AGENT_INTERNAL_TOKEN = os.getenv("AGENT_INTERNAL_TOKEN", "")
 # ---------------------------------------------------------------------------
 
 def _get_fernet():
-    """Build a Fernet instance from CREDENTIAL_ENCRYPTION_KEY (env/config)."""
+    """Build a Fernet instance from CREDENTIAL_ENCRYPTION_KEY (env/config).
+    Key derivation MUST match src/api/sites.py: space-pad then truncate to 32 bytes.
+    """
     from cryptography.fernet import Fernet
 
     raw = os.getenv("CREDENTIAL_ENCRYPTION_KEY", "changeme32byteskeyplaceholder123").encode()
-    # Pad/truncate to exactly 32 bytes then base64url-encode → valid Fernet key
-    key = base64.urlsafe_b64encode(raw[:32].ljust(32, b"\0"))
+    # Space-pad to 32 bytes then truncate (matches API key derivation)
+    key = base64.urlsafe_b64encode(raw.ljust(32)[:32])
     return Fernet(key)
 
 
@@ -81,10 +84,14 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
             .all()
         ) if issue.site_id else []
 
-        credential_map = {
-            c.credential_type.value: _decrypt(c.encrypted_value)
-            for c in creds
-        }
+        # Decrypt and parse each credential — stored as JSON strings
+        credential_map: dict[str, dict | str] = {}
+        for c in creds:
+            raw = _decrypt(c.encrypted_value)
+            try:
+                credential_map[c.credential_type.value] = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                credential_map[c.credential_type.value] = raw
 
         # Fetch recent chat history so dev can see user feedback
         from src.db.models import ChatMessage, SenderType, TicketAttachment
@@ -137,13 +144,53 @@ def _fetch_issue_context(issue_id: str, db_url: str) -> dict:
 # Task prompt builder
 # ---------------------------------------------------------------------------
 
+def _format_credential(ctype: str, value) -> str:
+    """Format a credential for display in the prompt."""
+    if isinstance(value, dict):
+        # Pretty-print known types
+        if ctype == "ssh":
+            parts = [f"host={value.get('host', '')}", f"user={value.get('user', value.get('username', ''))}",
+                     f"password={value.get('password', '')}"]
+            port = value.get("port")
+            if port and str(port) != "22":
+                parts.append(f"port={port}")
+            return "SSH: " + ", ".join(parts)
+        if ctype == "ftp":
+            parts = [f"host={value.get('host', '')}", f"user={value.get('user', value.get('username', ''))}",
+                     f"password={value.get('password', '')}"]
+            port = value.get("port")
+            if port and str(port) not in ("21", ""):
+                parts.append(f"port={port}")
+            return "FTP: " + ", ".join(parts)
+        if ctype == "wp_admin":
+            return (f"WP Admin: url={value.get('url', '')}, "
+                    f"username={value.get('username', '')}, password={value.get('password', '')}")
+        if ctype == "wp_app_password":
+            return (f"WP App Password: username={value.get('username', '')}, "
+                    f"app_password={value.get('app_password', '')}")
+        if ctype == "database":
+            parts = [f"host={value.get('host', '')}", f"user={value.get('user', value.get('username', ''))}",
+                     f"password={value.get('password', '')}", f"name={value.get('name', value.get('db_name', ''))}"]
+            port = value.get("port")
+            if port:
+                parts.append(f"port={port}")
+            return "Database: " + ", ".join(parts)
+        if ctype == "cpanel":
+            return (f"cPanel: url={value.get('url', '')}, "
+                    f"username={value.get('username', '')}, password={value.get('password', '')}")
+        # Generic dict
+        pairs = ", ".join(f"{k}={v}" for k, v in value.items())
+        return f"{ctype}: {pairs}"
+    return f"{ctype}: {value}"
+
+
 def _build_task_prompt(ctx: dict) -> str:
     """
     Build the full task prompt for the spawned OpenClaw sub-agent.
     Includes the issue context, credentials, what to do, and callback instructions.
     """
     cred_lines = "\n".join(
-        f"  - {k}: {v}" for k, v in ctx["credential_map"].items()
+        f"  {_format_credential(k, v)}" for k, v in ctx["credential_map"].items()
     ) or "  (no credentials on file)"
 
     fail_note = (
@@ -201,7 +248,13 @@ Site: {ctx["site_name"]} ({ctx["site_url"]})
 ## Instructions
 1. Read the description AND the conversation history above carefully.
 2. If the customer provided specific feedback about what is wrong, fix THAT exact issue — not the general description.
-3. Use exec/SSH to implement the fix on the live site.
+3. Use the most appropriate method to implement the fix based on available credentials:
+   - **SSH** (if ssh credential available): direct file access, WP-CLI, running commands — preferred for deep fixes
+   - **WP Admin** (if wp_admin or wp_app_password credential available): login at /wp-admin, install plugins, configure settings via UI
+   - **FTP** (if ftp credential available): upload/modify files when SSH is unavailable
+   - **Database** (if database credential available): direct DB queries for data fixes
+   - **cPanel** (if cpanel credential available): server management via cPanel UI
+   Choose the best tool for the task. Multiple methods can be combined.
 4. **REQUIRED — Visual verification via browser:**
    - Open the browser and navigate to the relevant page on the site
    - Interact with the feature (fill forms, click buttons, etc.)

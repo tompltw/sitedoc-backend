@@ -215,6 +215,7 @@ def transition_issue_direct(
             issue.dev_fail_count = (issue.dev_fail_count or 0) + 1
 
         should_enqueue_dev = to_col == "todo"
+        should_enqueue_qa = to_col == "ready_for_qa"
 
         transition = TicketTransition(
             issue_id=uuid.UUID(issue_id),
@@ -234,6 +235,14 @@ def transition_issue_direct(
             logger.info("[base] dev_agent enqueued for issue %s (todo transition)", issue_id)
         except Exception as e:
             logger.error("[base] Could not enqueue dev_agent for %s: %s", issue_id, e)
+
+    # Auto-enqueue qa agent when ticket moves to ready_for_qa
+    if should_enqueue_qa:
+        try:
+            celery_app.send_task("src.tasks.qa_agent.run", args=[issue_id], queue="backend")
+            logger.info("[base] qa_agent enqueued for issue %s (ready_for_qa transition)", issue_id)
+        except Exception as e:
+            logger.error("[base] Could not enqueue qa_agent for %s: %s", issue_id, e)
 
 
 def get_issue(issue_id: str, db_url: str):

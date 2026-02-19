@@ -2,6 +2,7 @@
 Sites and credentials routes.
 """
 import base64
+import json
 import uuid
 
 from cryptography.fernet import Fernet
@@ -156,7 +157,12 @@ async def add_credential(
     _get_site_or_404(site, site_id, current_customer.id)
 
     fernet = _get_fernet()
-    encrypted = fernet.encrypt(body.value.encode()).decode()
+    # Accept dict or string; always encrypt a JSON string
+    if isinstance(body.value, dict):
+        raw_value = json.dumps(body.value)
+    else:
+        raw_value = body.value
+    encrypted = fernet.encrypt(raw_value.encode()).decode()
 
     credential = SiteCredential(
         site_id=site_id,
@@ -186,6 +192,31 @@ async def list_credentials(
         .order_by(SiteCredential.created_at.desc())
     )
     return cred_result.scalars().all()
+
+
+@router.delete("/{site_id}/credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_credential(
+    site_id: uuid.UUID,
+    credential_id: uuid.UUID,
+    current_customer: Customer = Depends(get_current_customer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a specific credential from a site."""
+    # Verify site ownership
+    site_result = await db.execute(select(Site).where(Site.id == site_id))
+    site = site_result.scalar_one_or_none()
+    _get_site_or_404(site, site_id, current_customer.id)
+
+    cred_result = await db.execute(
+        select(SiteCredential).where(
+            SiteCredential.id == credential_id,
+            SiteCredential.site_id == site_id,
+        )
+    )
+    cred = cred_result.scalar_one_or_none()
+    if cred is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
+    await db.delete(cred)
 
 
 # ---------------------------------------------------------------------------

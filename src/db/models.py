@@ -93,6 +93,9 @@ class CredentialType(PyEnum):
     ftp = "ftp"
     wp_admin = "wp_admin"
     api_key = "api_key"
+    database = "database"
+    cpanel = "cpanel"
+    wp_app_password = "wp_app_password"
 
 
 class Customer(Base):

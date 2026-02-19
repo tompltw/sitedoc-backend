@@ -35,12 +35,89 @@ def _verify_token(authorization: str | None) -> None:
         )
 
 
+class SaveCredentialBody(BaseModel):
+    site_id: str
+    credential_type: str  # ssh | ftp | wp_admin | database | cpanel | wp_app_password | api_key
+    value: dict           # JSON-serialisable credential object
+
+
 class AgentResultBody(BaseModel):
     issue_id: str
     agent_role: str = "dev"           # "dev" | "qa" | "pm" | "tech_lead"
     status: str                        # "success" | "failure"
     message: str                       # Summary posted to chat
     transition_to: str | None = None  # kanban column to move to (None = no transition)
+
+
+@router.post("/save-credential", status_code=201)
+async def save_credential(
+    body: SaveCredentialBody,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """
+    Called by the PM agent to store a credential the customer provided in chat.
+    Authenticated by AGENT_INTERNAL_TOKEN.
+    """
+    import base64
+    import json as _json
+    from cryptography.fernet import Fernet
+    from src.core.config import settings
+
+    _verify_token(authorization)
+
+    # Validate credential type
+    from src.db.models import CredentialType
+    try:
+        ctype = CredentialType(body.credential_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Unknown credential_type: {body.credential_type}")
+
+    # Encrypt the credential
+    raw = settings.CREDENTIAL_ENCRYPTION_KEY.encode()
+    key = base64.urlsafe_b64encode(raw.ljust(32)[:32])
+    fernet = Fernet(key)
+    encrypted = fernet.encrypt(_json.dumps(body.value).encode()).decode()
+
+    # Upsert: delete existing credential of same type for site, then insert new one
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+    from src.db.models import SiteCredential, Site
+
+    engine = create_async_engine(DB_URL.replace("postgresql+psycopg2", "postgresql+asyncpg"))
+    async_session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with async_session() as session:
+        async with session.begin():
+            # Verify site exists
+            site_result = await session.execute(
+                select(Site).where(Site.id == uuid.UUID(body.site_id))
+            )
+            site = site_result.scalar_one_or_none()
+            if not site:
+                raise HTTPException(status_code=404, detail="Site not found")
+
+            # Delete any existing credential of same type
+            existing_result = await session.execute(
+                select(SiteCredential).where(
+                    SiteCredential.site_id == uuid.UUID(body.site_id),
+                    SiteCredential.credential_type == ctype,
+                )
+            )
+            for old_cred in existing_result.scalars().all():
+                await session.delete(old_cred)
+
+            # Insert new credential
+            new_cred = SiteCredential(
+                site_id=uuid.UUID(body.site_id),
+                credential_type=ctype,
+                encrypted_value=encrypted,
+            )
+            session.add(new_cred)
+
+    await engine.dispose()
+
+    logger.info("[internal] Saved %s credential for site %s", body.credential_type, body.site_id)
+    return {"ok": True, "credential_type": body.credential_type}
 
 
 @router.post("/agent-result")
@@ -79,7 +156,6 @@ async def agent_result(
             from src.tasks.base import get_db_session
 
             ALREADY_DONE_COLS = {
-                KanbanColumn.ready_for_qa, KanbanColumn.in_qa,
                 KanbanColumn.ready_for_uat, KanbanColumn.done, KanbanColumn.dismissed,
             }
             with get_db_session(DB_URL) as session:

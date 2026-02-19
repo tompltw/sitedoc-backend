@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, EmailStr
 
@@ -68,7 +68,9 @@ class SiteResponse(BaseModel):
 
 class CredentialCreate(BaseModel):
     credential_type: CredentialType
-    value: str
+    # Accept either a plain string or a JSON-serialisable dict.
+    # The backend will serialise dicts to JSON before encrypting.
+    value: Union[str, dict[str, Any]]
 
 
 class CredentialResponse(BaseModel):

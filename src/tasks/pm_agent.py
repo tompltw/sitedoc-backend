@@ -10,6 +10,7 @@ Flow:
   4. Post agent reply to DB (agent_role='pm') + publish WebSocket event.
   5. Detect ticket-confirmation JSON in reply → update issue + transition.
 """
+import base64
 import json
 import logging
 import os
@@ -61,7 +62,7 @@ When user requests changes after reviewing a fix: use `todo` to send back to dev
 ## Current ticket context
 Issue ID: {issue_id}
 Current stage: {kanban_column}
-SSH credentials on file: {has_ssh}
+Credentials on file: {credentials_summary}
 Issue description (already submitted by customer):
 <description>
 {description}
@@ -74,7 +75,7 @@ The four things needed before confirming:
 1. Clear description of the issue
 2. Exact reproduction steps
 3. Expected vs actual behaviour
-4. SSH credentials (only if NOT already on file — check has_ssh above)
+4. Access credentials (only if NONE are already on file — check credentials_summary above)
 
 **Decision tree (follow exactly):**
 
@@ -82,9 +83,12 @@ CASE A — description covers items 1, 2, AND 3:
   → Do NOT ask any questions. Write ONE message that summarises what you understood
     (issue, steps, expected vs actual), then ask the customer to confirm so you can
     create the ticket. Example opener: "Thanks for the details — here's what I've got: …"
-  → If SSH is already on file (has_ssh=yes): combine the summary + confirmation ask in
-    one message. Do not ask about SSH.
-  → If SSH is NOT on file: after the summary ask for SSH credentials in the same message.
+  → If credentials are already on file (credentials_summary shows any credentials): combine
+    the summary + confirmation ask in one message. Do not ask for credentials.
+  → If NO credentials are on file: after the summary, ask for SSH credentials (preferred)
+    OR WordPress admin credentials in the same message. Make it clear either works.
+  → If the customer mentions WordPress/plugin/theme topics and only database credentials are
+    on file (no SSH/WP Admin): ask for SSH or WP Admin credentials too.
 
 CASE B — description is missing one or more of items 1–3:
   → Ask ONLY for the specific missing pieces in a single message. Never ask for
@@ -92,6 +96,22 @@ CASE B — description is missing one or more of items 1–3:
 
 RULE: Never send more than one "intake" message. Combine all gaps into one ask.
 RULE: Never ask the customer to repeat something they already told you.
+
+## Credential collection
+If the customer provides credentials in their message (e.g. "my WP admin is admin/mypass" or
+"SSH: host=1.2.3.4, user=root, password=abc"), extract and save them by emitting:
+{{"save_credential": true, "credential_type": "<type>", "value": {{...JSON object...}}}}
+
+Supported types and their value shapes:
+- ssh: {{"host": "...", "user": "...", "password": "..."}}
+- wp_admin: {{"url": "...", "username": "...", "password": "..."}}
+- ftp: {{"host": "...", "user": "...", "password": "...", "port": 21}}
+- database: {{"host": "...", "user": "...", "password": "...", "name": "...", "port": 3306}}
+- cpanel: {{"url": "...", "username": "...", "password": "..."}}
+- wp_app_password: {{"username": "...", "app_password": "..."}}
+
+After saving, confirm to the customer: "Got it — I've saved your [type] credentials securely."
+Then continue with the normal ticket flow.
 
 Once you have all details, confirm with the customer. When they confirm, emit the ticket_confirmed JSON.
 
@@ -151,23 +171,73 @@ def _get_chat_history(issue_id: str, db_url: str) -> list[dict]:
         return history
 
 
-def _has_ssh_credentials(issue_id: str, db_url: str) -> bool:
-    """Check whether the site associated with this issue has SSH credentials on file."""
-    from src.db.models import Issue, SiteCredential, CredentialType
+def _get_credentials_summary(issue_id: str, db_url: str) -> str:
+    """Return a human-readable summary of which credential types are on file for the site."""
+    from src.db.models import Issue, SiteCredential
 
     with get_db_session(db_url) as session:
         issue = session.get(Issue, uuid.UUID(issue_id))
-        if issue is None:
-            return False
-        cred = (
+        if issue is None or not issue.site_id:
+            return "none"
+        creds = (
             session.query(SiteCredential)
-            .filter(
-                SiteCredential.site_id == issue.site_id,
-                SiteCredential.credential_type == CredentialType.ssh,
-            )
-            .first()
+            .filter(SiteCredential.site_id == issue.site_id)
+            .all()
         )
-        return cred is not None
+        if not creds:
+            return "none"
+        types = sorted(set(c.credential_type.value for c in creds))
+        return ", ".join(types)
+
+
+def _get_site_id_for_issue(issue_id: str, db_url: str) -> Optional[str]:
+    """Return the site_id for an issue, or None."""
+    from src.db.models import Issue
+
+    with get_db_session(db_url) as session:
+        issue = session.get(Issue, uuid.UUID(issue_id))
+        if issue is None or not issue.site_id:
+            return None
+        return str(issue.site_id)
+
+
+def _save_credential_via_api(site_id: str, credential_type: str, value: dict) -> bool:
+    """Call the internal API to store a credential. Returns True on success."""
+    import httpx
+
+    internal_url = os.getenv("INTERNAL_API_URL", "http://localhost:5000")
+    token = os.getenv("AGENT_INTERNAL_TOKEN", "")
+    url = f"{internal_url}/api/v1/internal/save-credential"
+    try:
+        resp = httpx.post(
+            url,
+            json={"site_id": site_id, "credential_type": credential_type, "value": value},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code in (200, 201):
+            return True
+        logger.warning("[pm_agent] save-credential API returned %s: %s", resp.status_code, resp.text)
+        return False
+    except Exception as e:
+        logger.error("[pm_agent] Failed to call save-credential API: %s", e)
+        return False
+
+
+def _extract_save_credential_json(text: str) -> Optional[dict]:
+    """
+    Look for {save_credential: true, credential_type: ..., value: {...}} in agent reply.
+    Returns parsed dict or None.
+    """
+    pattern = r'\{[^{}]*"save_credential"\s*:\s*true[^{}]*\}'
+    for raw in re.findall(pattern, text, re.DOTALL):
+        try:
+            data = json.loads(raw)
+            if data.get("save_credential") is True and data.get("credential_type") and data.get("value"):
+                return data
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def _extract_transition_json(text: str) -> Optional[str]:
@@ -220,6 +290,7 @@ def _strip_json_blocks(text: str) -> str:
     text = re.sub(r'\{[^{}]*"ticket_action"[^{}]*\}\n?', '', text)
     text = re.sub(r'\{[^{}]*"ticket_confirmed"[^{}]*\}\n?', '', text)
     text = re.sub(r'\{[^{}]*"update_description"[^{}]*\}\n?', '', text)
+    text = re.sub(r'\{[^{}]*"save_credential"[^{}]*\}\n?', '', text)
     return text.strip()
 
 
@@ -268,14 +339,14 @@ def handle_message(issue_id: str, user_message: str) -> None:
         # 1. Fetch existing conversation history
         history = _get_chat_history(issue_id, DB_URL)
 
-        # 2. Fetch issue context + SSH status for the system prompt
+        # 2. Fetch issue context + credentials summary for the system prompt
         issue_ctx = _get_issue_context(issue_id, DB_URL)
-        has_ssh = _has_ssh_credentials(issue_id, DB_URL)
+        credentials_summary = _get_credentials_summary(issue_id, DB_URL)
 
         system_prompt = PM_SYSTEM_PROMPT_BASE.format(
             issue_id=issue_id,
             kanban_column=issue_ctx["kanban_column"],
-            has_ssh="yes" if has_ssh else "no",
+            credentials_summary=credentials_summary,
             description=issue_ctx.get("description", ""),
         )
 
@@ -293,6 +364,20 @@ def handle_message(issue_id: str, user_message: str) -> None:
         visible_reply = _strip_json_blocks(agent_reply)
         if visible_reply:
             post_chat_message(issue_id, visible_reply, "pm", DB_URL)
+
+        # 5b. Handle save_credential JSON — agent parsed credentials from customer message
+        cred_data = _extract_save_credential_json(agent_reply)
+        if cred_data:
+            site_id = _get_site_id_for_issue(issue_id, DB_URL)
+            if site_id:
+                ok = _save_credential_via_api(site_id, cred_data["credential_type"], cred_data["value"])
+                if ok:
+                    logger.info("[pm_agent] Saved %s credential for site %s via API",
+                                cred_data["credential_type"], site_id)
+                else:
+                    logger.warning("[pm_agent] Failed to save credential for site %s", site_id)
+            else:
+                logger.warning("[pm_agent] No site_id found for issue %s — cannot save credential", issue_id)
 
         # 6. Handle description update (append user feedback before transitioning)
         description_append = _extract_description_update(agent_reply)
