@@ -33,7 +33,7 @@ async def root():
 
 
 # Register routers
-from src.api import auth, sites, issues, chat, ws, billing, pipeline, internal, attachments  # noqa: E402
+from src.api import auth, sites, issues, chat, ws, billing, pipeline, internal, attachments, admin  # noqa: E402
 
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(sites.router, prefix="/api/v1/sites", tags=["sites"])
@@ -43,4 +43,5 @@ app.include_router(pipeline.router, prefix="/api/v1", tags=["pipeline"])
 app.include_router(billing.router, prefix="/api/v1/billing", tags=["billing"])
 app.include_router(attachments.router, prefix="/api/v1", tags=["attachments"])
 app.include_router(internal.router, tags=["internal"])
+app.include_router(admin.router, tags=["admin"])
 app.include_router(ws.router, tags=["websocket"])

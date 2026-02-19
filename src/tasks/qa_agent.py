@@ -25,7 +25,7 @@ import requests
 from src.db.models import AgentAction, ActionStatus
 from src.services.notifications import notify_admin_failure
 from src.tasks.llm import call_llm
-from src.tasks.openclaw import spawn_agent
+from src.tasks.openclaw import spawn_agent, get_model_for_role
 from src.tasks.base import (
     celery_app,
     get_db_session,
@@ -477,6 +477,7 @@ def run(issue_id: str) -> None:
         result = spawn_agent(
             task=task_prompt,
             label=f"qa-agent-{issue_id[:8]}",
+            model=get_model_for_role("qa"),
         )
         logger.info("[qa_agent] QA agent spawned for issue %s: %s", issue_id, result)
 

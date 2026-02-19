@@ -28,7 +28,7 @@ from src.tasks.base import (
     transition_issue,
     try_acquire_agent_lock,
 )
-from src.tasks.openclaw import spawn_agent
+from src.tasks.openclaw import spawn_agent, get_model_for_role
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +364,7 @@ def run(issue_id: str) -> None:
         result = spawn_agent(
             task=task_prompt,
             label=f"dev-agent-{issue_id[:8]}",
+            model=get_model_for_role("dev"),
         )
         logger.info("[dev_agent] Agent spawned for issue %s: %s", issue_id, result)
 
