@@ -148,9 +148,12 @@ async def agent_result(
         issue_id, body.agent_role, body.status, body.transition_to,
     )
 
-    # Idempotency guard: skip if the target column is same or earlier in the pipeline.
-    # This prevents backwards transitions (e.g. ready_for_qa when already in_qa)
-    # and duplicate callbacks from re-running completed stages.
+    # Idempotency guard: block stale/duplicate callbacks that would send a ticket
+    # backward when no agent currently owns that stage.
+    #
+    # Exception: if the calling agent is the *active* owner of the current stage,
+    # allow any transition — forward (success) OR backward (failure rollback).
+    # e.g. qa reporting from in_qa → todo is a legitimate failure and must be allowed.
     if body.transition_to:
         try:
             from src.db.models import Issue
@@ -161,6 +164,13 @@ async def agent_result(
                 "ready_for_qa", "in_qa", "ready_for_uat", "done", "dismissed",
             ]
 
+            # Stages owned by each agent role — if the ticket is in this stage and
+            # this agent is reporting, allow any transition (success OR failure rollback).
+            AGENT_OWNS_STAGE = {
+                "dev": "in_progress",
+                "qa":  "in_qa",
+            }
+
             def _col_idx(val: str) -> int:
                 try:
                     return PIPELINE_ORDER.index(val)
@@ -170,13 +180,21 @@ async def agent_result(
             with get_db_session(DB_URL) as session:
                 issue = session.get(Issue, uuid.UUID(issue_id))
                 if issue:
-                    current_idx = _col_idx(issue.kanban_column.value if issue.kanban_column else "")
+                    current_col = issue.kanban_column.value if issue.kanban_column else ""
+                    current_idx = _col_idx(current_col)
                     target_idx  = _col_idx(body.transition_to)
-                    if target_idx >= 0 and current_idx >= target_idx:
+                    expected_stage = AGENT_OWNS_STAGE.get(body.agent_role)
+
+                    if expected_stage and current_col == expected_stage:
+                        # Active agent for this stage — allow forward (success) or backward (failure)
+                        pass
+                    elif target_idx >= 0 and current_idx >= target_idx:
                         logger.warning(
-                            "[internal] Skipping callback for %s — already at '%s', target '%s' is same or earlier",
+                            "[internal] Skipping stale callback for %s — already at '%s', target '%s' is same or earlier",
                             issue_id, issue.kanban_column, body.transition_to,
                         )
+                        # Still release the lock so the next agent can pick up the ticket
+                        release_agent_lock(issue_id, body.agent_role)
                         return {"ok": True, "skipped": "already_at_or_past_target"}
         except Exception as e:
             logger.error("[internal] Idempotency check failed for issue %s: %s", issue_id, e)

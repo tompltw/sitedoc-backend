@@ -2,9 +2,12 @@
 Stall checker — Celery Beat task, runs every 5 minutes.
 
 Recovery tiers:
-  1. `todo` tickets not picked up in >5 min     → re-enqueue dev agent
-  2. `ready_for_qa` tickets not picked up in >5m → re-enqueue qa agent
-  3. `in_progress` / `in_qa` stuck >4h          → escalate to tech lead
+  1. `todo` tickets not picked up in >5 min      → re-enqueue dev agent
+  2. `ready_for_qa` tickets not picked up in >5m  → re-enqueue qa agent
+  2b. `in_qa` stuck >20 min                       → rollback to ready_for_qa + re-enqueue qa
+  2c. `in_progress` stuck >20 min                 → rollback to todo + re-enqueue dev
+  3. `in_progress` / `in_qa` stuck >45 min        → post visible warning (safety net)
+  4. `in_progress` / `in_qa` stuck >4h            → escalate to tech lead
 """
 import logging
 import os
@@ -12,13 +15,15 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import text
 
-from src.tasks.base import celery_app, get_db_session, post_chat_message
+from src.tasks.base import celery_app, get_db_session, post_chat_message, transition_issue_direct
 
 logger = logging.getLogger(__name__)
 
 DB_URL = os.getenv("DATABASE_URL", "")
 STALL_THRESHOLD_HOURS = int(os.getenv("STALL_THRESHOLD_HOURS", "4"))
+STALL_INPROGRESS_MINUTES = int(os.getenv("STALL_INPROGRESS_MINUTES", "45"))  # in_progress/in_qa stuck alert
 TODO_PICKUP_MINUTES = int(os.getenv("TODO_PICKUP_MINUTES", "5"))
+AGENT_STUCK_MINUTES = int(os.getenv("AGENT_STUCK_MINUTES", "20"))  # > 15-min OpenClaw timeout
 
 
 def _last_activity_query() -> str:
@@ -43,6 +48,8 @@ def check_stalled_tickets():
 
     now = datetime.now(timezone.utc)
     todo_cutoff = now - timedelta(minutes=TODO_PICKUP_MINUTES)
+    agent_stuck_cutoff = now - timedelta(minutes=AGENT_STUCK_MINUTES)
+    inprogress_cutoff = now - timedelta(minutes=STALL_INPROGRESS_MINUTES)
     stall_cutoff = now - timedelta(hours=STALL_THRESHOLD_HOURS)
 
     with get_db_session(DB_URL) as session:
@@ -97,7 +104,81 @@ def check_stalled_tickets():
                 logger.error("[stall_checker] qa re-trigger failed for %s: %s", issue_id, e)
             continue
 
-        # Tier 3: long-running in_progress / in_qa → escalate
+        # Tier 2b: in_qa stuck > agent timeout → QA agent died without callback → retry
+        if kanban_col == "in_qa" and last_activity < agent_stuck_cutoff:
+            logger.warning(
+                "[stall_checker] issue %s stuck in 'in_qa' for >%dmin — rolling back to ready_for_qa",
+                issue_id, AGENT_STUCK_MINUTES,
+            )
+            try:
+                transition_issue_direct(
+                    issue_id=issue_id,
+                    to_col="ready_for_qa",
+                    actor_type="stall_checker",
+                    note=f"QA agent did not respond within {AGENT_STUCK_MINUTES}min — resetting for retry.",
+                    db_url=DB_URL,
+                )
+                post_chat_message(
+                    issue_id=issue_id,
+                    content="🔄 QA agent did not respond — automatically retrying QA verification.",
+                    agent_role="system",
+                    db_url=DB_URL,
+                )
+            except Exception as e:
+                logger.error("[stall_checker] QA rollback failed for %s: %s", issue_id, e)
+            continue
+
+        # Tier 2c: in_progress stuck > agent timeout → dev agent died without callback → retry
+        if kanban_col == "in_progress" and last_activity < agent_stuck_cutoff:
+            logger.warning(
+                "[stall_checker] issue %s stuck in 'in_progress' for >%dmin — rolling back to todo",
+                issue_id, AGENT_STUCK_MINUTES,
+            )
+            try:
+                transition_issue_direct(
+                    issue_id=issue_id,
+                    to_col="todo",
+                    actor_type="stall_checker",
+                    note=f"Dev agent did not respond within {AGENT_STUCK_MINUTES}min — resetting for retry.",
+                    db_url=DB_URL,
+                )
+                post_chat_message(
+                    issue_id=issue_id,
+                    content="🔄 Dev agent did not respond — automatically retrying.",
+                    agent_role="system",
+                    db_url=DB_URL,
+                )
+            except Exception as e:
+                logger.error("[stall_checker] Dev rollback failed for %s: %s", issue_id, e)
+            continue
+
+        # Tier 3a: in_progress / in_qa stuck >45 min → post visible warning
+        if kanban_col in ("in_progress", "in_qa") and last_activity < inprogress_cutoff and last_activity >= stall_cutoff:
+            logger.warning(
+                "[stall_checker] issue %s stuck in '%s' for >%dm — posting stall warning",
+                issue_id, kanban_col, STALL_INPROGRESS_MINUTES,
+            )
+            try:
+                post_chat_message(
+                    issue_id=issue_id,
+                    content=(
+                        f"⏳ No activity detected for over {STALL_INPROGRESS_MINUTES} minutes. "
+                        "This may indicate the agent session ended without completing. "
+                        "Our team has been notified and will investigate."
+                    ),
+                    agent_role="system",
+                    db_url=DB_URL,
+                )
+                with get_db_session(DB_URL) as session:
+                    session.execute(
+                        text("UPDATE issues SET stall_check_at = now() + INTERVAL '30 minutes' WHERE id = :id"),
+                        {"id": issue_id},
+                    )
+            except Exception as e:
+                logger.error("[stall_checker] Stall warning failed for %s: %s", issue_id, e)
+            continue
+
+        # Tier 3b: long-running in_progress / in_qa >4h → escalate to tech lead
         if kanban_col in ("in_progress", "in_qa") and last_activity < stall_cutoff:
             reason = (
                 f"Stall detected: ticket stuck in '{kanban_col}' for >{STALL_THRESHOLD_HOURS}h. "
