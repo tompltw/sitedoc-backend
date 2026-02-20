@@ -33,6 +33,7 @@ section() { echo -e "\n${YELLOW}══ $* ══${NC}"; }
 section "Stopping services"
 
 # Celery worker loop + workers (sitedoc only — matched by app name)
+if pkill -f "start-beat.sh" 2>/dev/null; then info "Stopped start-beat.sh loop"; fi
 if pkill -f "start-worker.sh" 2>/dev/null; then info "Stopped start-worker.sh loop"; fi
 if pkill -f "celery.*src\.tasks\.base:celery_app worker" 2>/dev/null; then
   info "Stopped Celery worker(s)"
@@ -80,11 +81,8 @@ info "FastAPI started (PID: $!, log: sitedoc-backend/uvicorn.log)"
 nohup bash start-worker.sh >> celery_worker.log 2>&1 &
 info "Celery worker started (PID: $!, log: sitedoc-backend/celery_worker.log)"
 
-# Celery Beat
-nohup ./venv/bin/python -m celery \
-  -A src.tasks.base:celery_app beat \
-  --loglevel=info \
-  >> celery_beat.log 2>&1 &
+# Celery Beat (via start-beat.sh for auto-restart on crash)
+nohup bash start-beat.sh >> celery_beat.log 2>&1 &
 info "Celery Beat started (PID: $!, log: sitedoc-backend/celery_beat.log)"
 
 # Next.js

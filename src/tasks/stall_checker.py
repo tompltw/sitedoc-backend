@@ -61,6 +61,7 @@ def check_stalled_tickets():
                 {_last_activity_query()} AS last_activity_at
             FROM issues i
             WHERE i.kanban_column IN ('todo', 'ready_for_qa', 'in_progress', 'in_qa')
+              AND (i.stall_check_at IS NULL OR i.stall_check_at <= now())
         """)).fetchall()
 
     if not rows:

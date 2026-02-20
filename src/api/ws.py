@@ -177,7 +177,7 @@ async def issue_websocket(issue_id: str, websocket: WebSocket) -> None:
         async with async_session_factory() as db:
             result = await db.execute(
                 text("""
-                    SELECT status, confidence_score,
+                    SELECT status, confidence_score, kanban_column,
                            (SELECT count(*) FROM agent_actions WHERE issue_id = :issue_id) as action_count
                     FROM issues WHERE id = :issue_id
                 """),
@@ -190,7 +190,8 @@ async def issue_websocket(issue_id: str, websocket: WebSocket) -> None:
                     "issue_id": issue_id,
                     "status": row[0],
                     "confidence": float(row[1]) if row[1] else None,
-                    "actions_count": row[2],
+                    "kanban_column": row[2],
+                    "actions_count": row[3],
                 })
     except Exception as e:
         logger.warning("[ws] Could not send initial state: %s", e)

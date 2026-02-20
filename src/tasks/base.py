@@ -47,6 +47,7 @@ celery_app.conf.update(
         "stall-checker-every-5min": {
             "task": "src.tasks.stall_checker.check_stalled_tickets",
             "schedule": 5 * 60,  # every 5 minutes
+            "options": {"queue": "backend"},
         },
     },
 )
@@ -280,15 +281,16 @@ def transition_issue_direct(
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
-def try_acquire_agent_lock(issue_id: str, agent_role: str, ttl_seconds: int = 600) -> bool:
+def try_acquire_agent_lock(issue_id: str, agent_role: str, ttl_seconds: int = 960) -> bool:
     """
     Try to acquire a Redis lock for (agent_role, issue_id).
 
     Uses SET NX EX so only the first caller succeeds — any concurrent duplicate
     Celery task for the same issue will see the lock already held and abort.
 
-    The lock expires automatically after ttl_seconds (default 15 min, matching
-    the agent run timeout) so a crashed task can always be retried.
+    The lock expires automatically after ttl_seconds (default 16 min, 1 min
+    margin over the 15 min agent timeout) so a crashed task can always be
+    retried.
 
     Returns True if the lock was acquired, False if it was already held.
     """

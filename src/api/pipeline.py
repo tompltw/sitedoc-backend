@@ -13,9 +13,12 @@ Permitted transitions by actor:
   tech_lead:  any → in_progress; in_progress → ready_for_qa
   system:     any transition (internal use)
 """
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -149,6 +152,14 @@ async def transition_issue(
     )
     await db.commit()
     await db.refresh(issue)
+
+    try:
+        from src.api.ws import publish_event
+        issue_dict = IssueResponse.model_validate(issue).model_dump(mode='json')
+        publish_event(str(issue_id), {"type": "issue_updated", "issue": issue_dict})
+    except Exception as e:
+        logger.warning("[pipeline] WS broadcast failed for %s: %s", issue_id, e)
+
     return issue
 
 
@@ -200,9 +211,26 @@ async def transition_issue_internal(
     await db.commit()
     await db.refresh(issue)
 
+    # Broadcast status update via WebSocket
+    try:
+        from src.api.ws import publish_event
+        from src.api.issues import IssueResponse
+        
+        issue_dict = IssueResponse.model_validate(issue).model_dump(mode='json')
+        publish_event(str(issue_id), {
+            "type": "issue_updated",
+            "issue": issue_dict,
+        })
+    except Exception as e:
+        logger.warning("[pipeline] WebSocket broadcast failed for %s: %s", issue_id, e)
+
     # Enqueue dev agent when any internal actor sends ticket to todo
     if body.to_col == KanbanColumn.todo:
         _enqueue_dev_agent(str(issue_id))
+
+    # Enqueue QA agent when ticket moves to ready_for_qa
+    if body.to_col == KanbanColumn.ready_for_qa:
+        _enqueue_qa_agent(str(issue_id))
 
     return issue
 
@@ -291,21 +319,23 @@ def _kanban_to_legacy_status(col: KanbanColumn):
 
 def _enqueue_dev_agent(issue_id: str) -> None:
     try:
-        from celery import Celery
-        import os
-        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        from src.tasks.base import celery_app
         celery_app.send_task("src.tasks.dev_agent.run", args=[issue_id], queue="backend")
     except Exception:
-        import logging
-        logging.getLogger(__name__).warning("Could not enqueue dev_agent for %s", issue_id)
+        logger.warning("Could not enqueue dev_agent for %s", issue_id)
+
+
+def _enqueue_qa_agent(issue_id: str) -> None:
+    try:
+        from src.tasks.base import celery_app
+        celery_app.send_task("src.tasks.qa_agent.run", args=[issue_id], queue="backend")
+    except Exception:
+        logger.warning("Could not enqueue qa_agent for %s", issue_id)
 
 
 def _enqueue_tech_lead(issue_id: str, reason: str = "") -> None:
     try:
-        from celery import Celery
-        import os
-        celery_app = Celery(broker=os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+        from src.tasks.base import celery_app
         celery_app.send_task("src.tasks.tech_lead_agent.run", args=[issue_id, reason], queue="backend")
     except Exception:
-        import logging
-        logging.getLogger(__name__).warning("Could not enqueue tech_lead for %s", issue_id)
+        logger.warning("Could not enqueue tech_lead for %s", issue_id)
