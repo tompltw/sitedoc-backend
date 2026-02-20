@@ -9,7 +9,7 @@ from typing import Any, Optional, Union
 
 from pydantic import BaseModel, EmailStr
 
-from src.db.models import CredentialType, IssueStatus, IssuePriority, SiteStatus, SenderType, PlanType, KanbanColumn, AgentRole
+from src.db.models import CredentialType, IssueStatus, IssueType, IssuePriority, SiteStatus, SenderType, PlanType, KanbanColumn, AgentRole
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,10 @@ class SiteResponse(BaseModel):
     name: str
     status: SiteStatus
     last_health_check: Optional[datetime] = None
+    is_managed: bool = False
+    slug: Optional[str] = None
+    custom_domain: Optional[str] = None
+    provisioned_at: Optional[datetime] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -91,6 +95,7 @@ class IssueCreate(BaseModel):
     title: str
     description: Optional[str] = None
     priority: IssuePriority = IssuePriority.medium
+    issue_type: IssueType = IssueType.maintenance
 
 
 class IssueResponse(BaseModel):
@@ -99,6 +104,7 @@ class IssueResponse(BaseModel):
     customer_id: uuid.UUID
     title: str
     description: Optional[str] = None
+    issue_type: IssueType = IssueType.maintenance
     status: IssueStatus
     priority: IssuePriority
     confidence_score: Optional[float] = None
@@ -206,3 +212,25 @@ class CheckoutSessionResponse(BaseModel):
 
 class BillingPortalResponse(BaseModel):
     portal_url: str
+
+
+# ---------------------------------------------------------------------------
+# Site provisioning schemas
+# ---------------------------------------------------------------------------
+
+class SiteProvisionRequest(BaseModel):
+    name: str
+    slug: str  # subdomain slug, e.g. "my-restaurant"
+    description: Optional[str] = None
+    business_type: Optional[str] = None  # restaurant, salon, consulting, etc.
+
+
+class SiteProvisionResponse(BaseModel):
+    site_id: uuid.UUID
+    issue_id: Optional[uuid.UUID] = None
+    url: str
+    admin_url: str
+    slug: str
+    status: str = "provisioning"
+
+    model_config = {"from_attributes": True}

@@ -15,10 +15,12 @@ from src.api.schemas import (
     CredentialCreate,
     CredentialResponse,
     SiteCreate,
+    SiteProvisionRequest,
+    SiteProvisionResponse,
     SiteResponse,
 )
 from src.core.config import settings
-from src.db.models import Customer, Site, SiteAgent, SiteCredential
+from src.db.models import Customer, Issue, IssueType, Site, SiteAgent, SiteCredential
 from src.db.session import get_db
 
 router = APIRouter()
@@ -220,10 +222,174 @@ async def delete_credential(
 
 
 # ---------------------------------------------------------------------------
+# Site provisioning (managed hosting)
+# ---------------------------------------------------------------------------
+
+import logging
+import re
+import secrets
+
+logger = logging.getLogger(__name__)
+
+
+def _validate_slug(slug: str) -> str:
+    """Validate and normalize a site slug."""
+    slug = slug.lower().strip()
+    if not re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', slug):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Slug must be 3-63 characters, lowercase alphanumeric and hyphens only, cannot start/end with hyphen.",
+        )
+    return slug
+
+
+@router.post("/provision", response_model=SiteProvisionResponse, status_code=status.HTTP_201_CREATED)
+async def provision_site(
+    body: SiteProvisionRequest,
+    current_customer: Customer = Depends(get_current_customer),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Provision a new managed WordPress site on SiteDoc hosting.
+
+    1. Creates a Site record with is_managed=True
+    2. SSHs into the hosting server and runs provision-site.sh
+    3. Stores SSH/WP credentials for agent access
+    4. Optionally creates a site_build Issue if description is provided
+    """
+    slug = _validate_slug(body.slug)
+
+    # Check slug uniqueness
+    existing = await db.execute(select(Site).where(Site.slug == slug))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already taken.")
+
+    site_url = f"https://{slug}.sitedoc.site"
+    site_token = secrets.token_urlsafe(48)
+    db_password = secrets.token_urlsafe(24)
+
+    # Create Site record
+    site = Site(
+        customer_id=current_customer.id,
+        url=site_url,
+        name=body.name,
+        is_managed=True,
+        slug=slug,
+        server_ip=settings.HOSTING_SERVER_IP,
+        server_path=f"/var/www/sites/{slug}.sitedoc.site",
+        plugin_token=site_token,
+    )
+    db.add(site)
+    await db.flush()
+    await db.refresh(site)
+
+    # Auto-create default agents
+    db.add(SiteAgent(site_id=site.id, agent_role="pm", model="claude-haiku-4-5"))
+    db.add(SiteAgent(site_id=site.id, agent_role="dev", model="claude-sonnet-4-5"))
+
+    # Store SSH credentials for agent access (the hosting server)
+    fernet = _get_fernet()
+    ssh_creds = json.dumps({
+        "host": settings.HOSTING_SERVER_IP,
+        "user": settings.HOSTING_SSH_USER,
+        "key_path": settings.HOSTING_SSH_KEY_PATH,
+        "site_path": f"/var/www/sites/{slug}.sitedoc.site",
+    })
+    db.add(SiteCredential(
+        site_id=site.id,
+        credential_type="ssh",
+        encrypted_value=fernet.encrypt(ssh_creds.encode()).decode(),
+    ))
+
+    # Store WP admin credentials (will be set by provisioning script)
+    wp_admin_creds = json.dumps({
+        "url": f"{site_url}/wp-admin",
+        "username": "sitedoc",
+        "password": "(set during provisioning)",
+    })
+    db.add(SiteCredential(
+        site_id=site.id,
+        credential_type="wp_admin",
+        encrypted_value=fernet.encrypt(wp_admin_creds.encode()).decode(),
+    ))
+
+    await db.flush()
+
+    # Run provisioning via SSH (async in background via Celery)
+    from src.tasks.base import celery_app
+    celery_app.send_task(
+        "src.tasks.provision.provision_site",
+        args=[str(site.id), slug, body.name, site_token, db_password],
+        queue="backend",
+    )
+
+    # Create site_build issue if description provided
+    issue_id = None
+    if body.description:
+        build_title = f"Build site: {body.name}"
+        build_desc = body.description
+        if body.business_type:
+            build_desc = f"Business type: {body.business_type}\n\n{build_desc}"
+
+        issue = Issue(
+            site_id=site.id,
+            customer_id=current_customer.id,
+            title=build_title,
+            description=build_desc,
+            issue_type=IssueType.site_build,
+        )
+        db.add(issue)
+        await db.flush()
+        await db.refresh(issue)
+        issue_id = issue.id
+
+    return SiteProvisionResponse(
+        site_id=site.id,
+        issue_id=issue_id,
+        url=site_url,
+        admin_url=f"{site_url}/wp-admin",
+        slug=slug,
+        status="provisioning",
+    )
+
+
+@router.post("/{site_id}/custom-domain")
+async def set_custom_domain(
+    site_id: uuid.UUID,
+    body: dict,
+    current_customer: Customer = Depends(get_current_customer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a custom domain for a managed site. Customer must add CNAME first."""
+    result = await db.execute(select(Site).where(Site.id == site_id))
+    site = result.scalar_one_or_none()
+    _get_site_or_404(site, site_id, current_customer.id)
+
+    if not site.is_managed:
+        raise HTTPException(status_code=400, detail="Custom domains only for managed sites.")
+
+    domain = body.get("domain", "").strip().lower()
+    if not domain:
+        raise HTTPException(status_code=400, detail="domain is required")
+
+    site.custom_domain = domain
+    await db.flush()
+
+    # Trigger Caddy config update via Celery
+    from src.tasks.base import celery_app
+    celery_app.send_task(
+        "src.tasks.provision.add_custom_domain",
+        args=[str(site.id), site.slug, domain],
+        queue="backend",
+    )
+
+    return {"ok": True, "domain": domain, "message": "Custom domain configured. SSL will be provisioned automatically."}
+
+
+# ---------------------------------------------------------------------------
 # WordPress plugin endpoints — authenticated by site token (not JWT)
 # ---------------------------------------------------------------------------
 
-import secrets
 from fastapi import Header
 
 async def _get_site_by_token(

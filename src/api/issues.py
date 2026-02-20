@@ -83,6 +83,7 @@ async def create_issue(
         customer_id=current_customer.id,
         title=body.title,
         description=body.description,
+        issue_type=body.issue_type,
         priority=body.priority or IssuePriority.medium,
     )
     db.add(issue)

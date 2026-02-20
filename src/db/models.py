@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum as PyEnum
 
 from sqlalchemy import (
-    Column, String, DateTime, ForeignKey, Text, Integer,
+    Boolean, Column, String, DateTime, ForeignKey, Text, Integer,
     Float, Enum, BigInteger, func, text as sa_text
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -88,6 +88,11 @@ class SenderType(PyEnum):
     system = "system"
 
 
+class IssueType(PyEnum):
+    maintenance = "maintenance"
+    site_build = "site_build"
+
+
 class CredentialType(PyEnum):
     ssh = "ssh"
     ftp = "ftp"
@@ -124,6 +129,13 @@ class Site(Base):
     last_health_check = Column(DateTime(timezone=True))
     plugin_token = Column(String(128), unique=True, index=True)
     plugin_version = Column(String(32))
+    # Managed hosting fields
+    is_managed = Column(Boolean, nullable=False, default=False)
+    slug = Column(String(63), unique=True, index=True)
+    server_ip = Column(String(45))  # IP of the hosting server
+    server_path = Column(String(512))  # e.g. /var/www/sites/<slug>.sitedoc.site
+    custom_domain = Column(String(255))  # customer's own domain, if configured
+    provisioned_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     customer = relationship("Customer", back_populates="sites")
@@ -154,6 +166,7 @@ class Issue(Base):
     customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False)
     title = Column(String(500), nullable=False)
     description = Column(Text)
+    issue_type = Column(Enum(IssueType, name="issue_type", create_type=False), nullable=False, default=IssueType.maintenance)
     status = Column(Enum(IssueStatus, name="issue_status", create_type=False), nullable=False, default=IssueStatus.open)
     priority = Column(Enum(IssuePriority, name="issue_priority", create_type=False), nullable=False, default=IssuePriority.medium)
     confidence_score = Column(Float)

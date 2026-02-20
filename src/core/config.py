@@ -34,5 +34,12 @@ class Settings(BaseSettings):
     # Admin alert email — receives agent failure notifications (override via env var)
     ADMIN_ALERT_EMAIL: str = "saleturnkey@gmail.com"
 
+    # Managed hosting server
+    HOSTING_SERVER_IP: str = "69.10.55.138"
+    HOSTING_SSH_USER: str = "sitedoc"
+    HOSTING_SSH_KEY_PATH: str = ""  # path to SSH private key for hosting server
+    HOSTING_PROVISION_SCRIPT: str = "/opt/sitedoc-infra/scripts/provision-site.sh"
+    HOSTING_TEARDOWN_SCRIPT: str = "/opt/sitedoc-infra/scripts/teardown-site.sh"
+
 
 settings = Settings()
