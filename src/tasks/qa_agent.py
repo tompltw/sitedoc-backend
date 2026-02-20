@@ -31,6 +31,7 @@ from src.tasks.base import (
     get_db_session,
     get_issue,
     post_chat_message,
+    release_agent_lock,
     transition_issue,
     try_acquire_agent_lock,
 )
@@ -449,6 +450,7 @@ def run(issue_id: str) -> None:
                 "[qa_agent] Issue %s is in '%s', not ready_for_qa — aborting duplicate run",
                 issue_id, issue_snapshot.kanban_column,
             )
+            release_agent_lock(issue_id, "qa")  # always release on abort
             return
     except Exception as e:
         logger.warning("[qa_agent] Pre-flight check failed for %s: %s — proceeding anyway", issue_id, e)
@@ -493,6 +495,7 @@ def run(issue_id: str) -> None:
 
     except Exception as e:
         logger.exception("[qa_agent] Unhandled error for issue %s: %s", issue_id, e)
+        release_agent_lock(issue_id, "qa")  # release so retry can proceed
         # Recovery: put ticket back to ready_for_qa so it can be retried
         try:
             transition_issue(issue_id=issue_id, to_col="ready_for_qa",
