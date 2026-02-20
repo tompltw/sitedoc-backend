@@ -133,7 +133,7 @@ class Site(Base):
     is_managed = Column(Boolean, nullable=False, default=False)
     slug = Column(String(63), unique=True, index=True)
     server_ip = Column(String(45))  # IP of the hosting server
-    server_path = Column(String(512))  # e.g. /var/www/sites/<slug>.sitedoc.site
+    server_path = Column(String(512))  # e.g. /var/www/sites/<slug>.nkcreator.com
     custom_domain = Column(String(255))  # customer's own domain, if configured
     provisioned_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

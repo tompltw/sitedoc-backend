@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     HOSTING_SSH_KEY_PATH: str = ""  # path to SSH private key for hosting server
     HOSTING_PROVISION_SCRIPT: str = "/opt/sitedoc-infra/scripts/provision-site.sh"
     HOSTING_TEARDOWN_SCRIPT: str = "/opt/sitedoc-infra/scripts/teardown-site.sh"
+    HOSTING_DOMAIN: str = "nkcreator.com"  # wildcard domain for managed sites
 
 
 settings = Settings()

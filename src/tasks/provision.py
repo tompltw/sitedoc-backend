@@ -106,13 +106,13 @@ def provision_site(site_id: str, slug: str, site_name: str, site_token: str, db_
                     )
                     if wp_cred:
                         new_value = json.dumps({
-                            "url": result.get("admin_url", f"https://{slug}.sitedoc.site/wp-admin"),
+                            "url": result.get("admin_url", f"https://{slug}.nkcreator.com/wp-admin"),
                             "username": result.get("admin_user", "sitedoc"),
                             "password": result["admin_password"],
                         })
                         wp_cred.encrypted_value = fernet.encrypt(new_value.encode()).decode()
 
-        logger.info("[provision] Site %s provisioned successfully at https://%s.sitedoc.site", site_id, slug)
+        logger.info("[provision] Site %s provisioned successfully at https://%s.nkcreator.com", site_id, slug)
 
     except Exception as e:
         logger.exception("[provision] Failed to provision site %s: %s", site_id, e)
@@ -157,9 +157,9 @@ def add_custom_domain(site_id: str, slug: str, domain: str) -> None:
 
     try:
         # Create Caddy config file for the custom domain
-        caddy_config = f"""# Custom domain for {slug}.sitedoc.site
+        caddy_config = f"""# Custom domain for {slug}.nkcreator.com
 {domain} {{
-    root * /var/www/sites/{slug}.sitedoc.site
+    root * /var/www/sites/{slug}.nkcreator.com
     php_fastcgi unix//run/php/php8.2-fpm.sock
     file_server
     try_files {{path}} {{path}}/ /index.php?{{query}}

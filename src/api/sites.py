@@ -264,7 +264,7 @@ async def provision_site(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Slug already taken.")
 
-    site_url = f"https://{slug}.sitedoc.site"
+    site_url = f"https://{slug}.nkcreator.com"
     site_token = secrets.token_urlsafe(48)
     db_password = secrets.token_urlsafe(24)
 
@@ -276,7 +276,7 @@ async def provision_site(
         is_managed=True,
         slug=slug,
         server_ip=settings.HOSTING_SERVER_IP,
-        server_path=f"/var/www/sites/{slug}.sitedoc.site",
+        server_path=f"/var/www/sites/{slug}.nkcreator.com",
         plugin_token=site_token,
     )
     db.add(site)
@@ -293,7 +293,7 @@ async def provision_site(
         "host": settings.HOSTING_SERVER_IP,
         "user": settings.HOSTING_SSH_USER,
         "key_path": settings.HOSTING_SSH_KEY_PATH,
-        "site_path": f"/var/www/sites/{slug}.sitedoc.site",
+        "site_path": f"/var/www/sites/{slug}.nkcreator.com",
     })
     db.add(SiteCredential(
         site_id=site.id,
