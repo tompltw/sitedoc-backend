@@ -25,6 +25,7 @@ from src.tasks.base import (
     get_db_session,
     get_issue,
     post_chat_message,
+    release_agent_lock,
     transition_issue,
     try_acquire_agent_lock,
 )
@@ -273,13 +274,14 @@ Site: {ctx["site_name"]} ({ctx["site_url"]})
    - **Database** (if database credential available): direct DB queries for data fixes
    - **cPanel** (if cpanel credential available): server management via cPanel UI
    Choose the best tool for the task. Multiple methods can be combined.
-4. **REQUIRED — Visual verification via browser:**
-   - Open the browser and navigate to the relevant page on the site
-   - Interact with the feature (fill forms, click buttons, etc.)
-   - Take a screenshot and visually confirm the fix matches the requirements exactly
-   - Check layout (left/right position, above/below order), content, and behaviour
-   - Do NOT self-report success based on reading your own code — verify by seeing it in the browser
-5. When finished (and only after visual confirmation), call the callback below, then close the browser to free memory.
+4. **Visual verification via browser (attempt immediately after applying the fix):**
+   - Open the browser and navigate to: {ctx["site_url"]}
+   - Take a screenshot of the relevant page or section
+   - Confirm the change is visible and looks correct
+   - If the browser fails or times out, note it in the callback message and proceed to step 5
+5. **REQUIRED — Call the callback when the fix is applied:**
+   - Call the callback whether or not browser verification succeeded
+   - State clearly: what you changed, what file/method you used, and whether you visually verified it
 
 ## Callback (REQUIRED — call this when done)
 POST {callback_url}
@@ -303,7 +305,9 @@ Body (failure):
   "transition_to": null
 }}
 
-Start working now. Be thorough and verify before calling the callback.
+**IMPORTANT**: Call the callback even if browser verification failed or was skipped. The callback is mandatory — not calling it will leave the ticket stuck.
+
+Start working now.
 """
 
 
@@ -332,6 +336,7 @@ def run(issue_id: str) -> None:
                 "[dev_agent] Issue %s is in '%s', not todo — aborting duplicate run",
                 issue_id, issue_snapshot.kanban_column,
             )
+            release_agent_lock(issue_id, "dev")  # always release on abort
             return
     except Exception as e:
         logger.warning("[dev_agent] Pre-flight check failed for %s: %s — proceeding anyway", issue_id, e)
@@ -381,6 +386,7 @@ def run(issue_id: str) -> None:
 
     except Exception as e:
         logger.exception("[dev_agent] Failed to spawn agent for issue %s: %s", issue_id, e)
+        release_agent_lock(issue_id, "dev")  # release so retry can proceed
         # Recovery: put ticket back to todo so stall checker can re-trigger quickly
         try:
             transition_issue(issue_id=issue_id, to_col="todo",

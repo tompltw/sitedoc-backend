@@ -117,8 +117,19 @@ def post_chat_message(
 
     # Publish WebSocket event (outside session — no DB dependency)
     try:
+        from datetime import datetime, timezone
         publish_event(issue_id, {
             "type": "message",
+            # Full ChatMessage-shaped object so the frontend can append directly
+            "message": {
+                "id": msg_id,
+                "issue_id": issue_id,
+                "sender_type": "agent",
+                "agent_role": agent_role,
+                "content": content,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            # Legacy fields kept for backwards compat
             "role": "agent",
             "agent_role": agent_role,
             "content": content,
@@ -226,7 +237,23 @@ def transition_issue_direct(
         )
         session.add(transition)
 
+        # Build WS payload inside the session while the issue object is still attached
+        # (IssueResponse has only scalar columns — no lazy-loaded relationships)
+        try:
+            from src.api.schemas import IssueResponse as _IssueResponse
+            _issue_ws_dict = _IssueResponse.model_validate(issue).model_dump(mode="json")
+        except Exception as _e:
+            logger.warning("[base] Could not serialise issue for WS: %s", _e)
+            _issue_ws_dict = None
+
     logger.info("[base] transition_direct issue %s → %s (%s)", issue_id, to_col, actor_type)
+
+    # Publish issue_updated event so the frontend updates the status badge in real-time
+    if _issue_ws_dict is not None:
+        try:
+            publish_event(issue_id, {"type": "issue_updated", "issue": _issue_ws_dict})
+        except Exception as e:
+            logger.warning("[base] WS issue_updated publish failed for %s: %s", issue_id, e)
 
     # Auto-enqueue dev agent when ticket moves to todo
     if should_enqueue_dev:
@@ -248,7 +275,7 @@ def transition_issue_direct(
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 
-def try_acquire_agent_lock(issue_id: str, agent_role: str, ttl_seconds: int = 900) -> bool:
+def try_acquire_agent_lock(issue_id: str, agent_role: str, ttl_seconds: int = 600) -> bool:
     """
     Try to acquire a Redis lock for (agent_role, issue_id).
 
