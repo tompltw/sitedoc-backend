@@ -104,12 +104,16 @@ def post_chat_message(
     from src.db.models import ChatMessage, SenderType
     from src.api.ws import publish_event
 
+    # "system" is a virtual role used by internal callers — stored as sender_type=system
+    # with no agent_role (the DB constraint only allows pm/dev/qa/tech_lead or NULL).
+    is_system = agent_role == "system"
+
     with get_db_session(db_url) as session:
         msg = ChatMessage(
             issue_id=uuid.UUID(issue_id),
-            sender_type=SenderType.agent,
+            sender_type=SenderType.system if is_system else SenderType.agent,
             content=content,
-            agent_role=agent_role,
+            agent_role=None if is_system else agent_role,
         )
         session.add(msg)
         session.flush()
@@ -251,6 +255,7 @@ def transition_issue_direct(
     # Publish issue_updated event so the frontend updates the status badge in real-time
     if _issue_ws_dict is not None:
         try:
+            from src.api.ws import publish_event
             publish_event(issue_id, {"type": "issue_updated", "issue": _issue_ws_dict})
         except Exception as e:
             logger.warning("[base] WS issue_updated publish failed for %s: %s", issue_id, e)

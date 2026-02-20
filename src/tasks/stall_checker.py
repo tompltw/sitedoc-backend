@@ -114,7 +114,7 @@ def check_stalled_tickets():
                 transition_issue_direct(
                     issue_id=issue_id,
                     to_col="ready_for_qa",
-                    actor_type="stall_checker",
+                    actor_type="system",
                     note=f"QA agent did not respond within {AGENT_STUCK_MINUTES}min — resetting for retry.",
                     db_url=DB_URL,
                 )
@@ -138,7 +138,7 @@ def check_stalled_tickets():
                 transition_issue_direct(
                     issue_id=issue_id,
                     to_col="todo",
-                    actor_type="stall_checker",
+                    actor_type="system",
                     note=f"Dev agent did not respond within {AGENT_STUCK_MINUTES}min — resetting for retry.",
                     db_url=DB_URL,
                 )
