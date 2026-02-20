@@ -212,6 +212,11 @@ class AgentAction(Base):
     status = Column(Enum(ActionStatus, name="action_status", create_type=False), nullable=False, default=ActionStatus.pending)
     before_state = Column(Text)  # JSON snapshot
     after_state = Column(Text)   # JSON snapshot
+    # Token / cost tracking
+    model_used = Column(String(100), nullable=True)
+    prompt_tokens = Column(Integer, nullable=True)
+    completion_tokens = Column(Integer, nullable=True)
+    total_tokens = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     issue = relationship("Issue", back_populates="agent_actions")

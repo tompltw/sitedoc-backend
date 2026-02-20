@@ -9,9 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_customer
-from src.api.schemas import IssueCreate, IssueResponse, IssueStatusUpdate
+from src.api.schemas import AgentActionResponse, IssueCreate, IssueResponse, IssueStatusUpdate
 from src.db.models import (
-    Customer, Issue, IssueStatus, IssuePriority,
+    AgentAction, Customer, Issue, IssueStatus, IssuePriority,
     KanbanColumn, TicketTransition,
 )
 from src.db.session import get_db
@@ -93,6 +93,24 @@ async def create_issue(
     _enqueue_diagnose_task(issue_id=str(issue.id))
 
     return issue
+
+
+@router.get("/{issue_id}/actions", response_model=list[AgentActionResponse])
+async def list_actions(
+    issue_id: uuid.UUID,
+    current_customer: Customer = Depends(get_current_customer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all agent actions for a given issue (owned by the current customer)."""
+    # Verify ownership
+    await _get_issue_for_customer(issue_id, current_customer.id, db)
+
+    result = await db.execute(
+        select(AgentAction)
+        .where(AgentAction.issue_id == issue_id)
+        .order_by(AgentAction.created_at.asc())
+    )
+    return result.scalars().all()
 
 
 @router.get("/{issue_id}", response_model=IssueResponse)

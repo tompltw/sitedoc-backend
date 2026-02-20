@@ -370,11 +370,30 @@ def handle_message(issue_id: str, user_message: str) -> None:
         messages = history + [{"role": "user", "content": user_message}]
 
         # 4. Call OpenClaw agent via gateway
-        agent_reply = call_llm(
+        llm_resp = call_llm(
             system_prompt=system_prompt,
             messages=messages,
-        ).strip()
-        logger.info("[pm_agent] Got reply for issue %s (%d chars)", issue_id, len(agent_reply))
+        )
+        agent_reply = llm_resp.content.strip()
+        logger.info("[pm_agent] Got reply for issue %s (%d chars, model=%s, tokens=%d)",
+                    issue_id, len(agent_reply), llm_resp.model, llm_resp.total_tokens)
+
+        # Log token usage as an AgentAction record
+        try:
+            with get_db_session(DB_URL) as session:
+                session.add(AgentAction(
+                    issue_id=uuid.UUID(issue_id),
+                    action_type="llm_call",
+                    description="pm_agent reply",
+                    status=ActionStatus.completed,
+                    model_used=llm_resp.model,
+                    prompt_tokens=llm_resp.prompt_tokens,
+                    completion_tokens=llm_resp.completion_tokens,
+                    total_tokens=llm_resp.total_tokens,
+                ))
+                session.commit()
+        except Exception as tok_err:
+            logger.warning("[pm_agent] Could not log token usage for %s: %s", issue_id, tok_err)
 
         # 5. Strip internal JSON blocks before posting to customer
         visible_reply = _strip_json_blocks(agent_reply)

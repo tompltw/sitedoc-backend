@@ -116,6 +116,29 @@ class IssueStatusUpdate(BaseModel):
     status: IssueStatus
 
 
+# ---------------------------------------------------------------------------
+# Agent action schemas
+# ---------------------------------------------------------------------------
+
+class AgentActionResponse(BaseModel):
+    id: uuid.UUID
+    issue_id: uuid.UUID
+    action_type: str
+    description: Optional[str] = None
+    status: str
+    before_state: Optional[str] = None
+    after_state: Optional[str] = None
+    error_detail: Optional[str] = None
+    # Token tracking
+    model_used: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class IssueTransitionRequest(BaseModel):
     to_col: KanbanColumn
     note: Optional[str] = None

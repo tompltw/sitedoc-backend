@@ -14,7 +14,20 @@ logger = logging.getLogger(__name__)
 
 OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "0c3fa3ffecad310e0cf6a5c579ca9aed70d0343e1daccbe1")
-OPENCLAW_AGENT_ID = os.getenv("OPENCLAW_AGENT_ID", "main")
+OPENCLAW_AGENT_ID = os.getenv("OPENCLAW_AGENT_ID", "sitedoc")
+
+
+class LLMResponse:
+    """Wraps LLM response content + token usage metadata."""
+    def __init__(self, content: str, model: str, prompt_tokens: int, completion_tokens: int):
+        self.content = content
+        self.model = model
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = prompt_tokens + completion_tokens
+
+    def __str__(self) -> str:
+        return self.content
 
 
 def call_llm(
@@ -22,7 +35,7 @@ def call_llm(
     messages: list[dict],
     model: Optional[str] = None,  # ignored — OpenClaw uses its configured model
     timeout: int = 300,
-) -> str:
+) -> "LLMResponse":
     """
     Call the OpenClaw gateway's /v1/chat/completions endpoint.
 
@@ -33,7 +46,7 @@ def call_llm(
         timeout: Request timeout in seconds.
 
     Returns:
-        The assistant's response content as a string.
+        LLMResponse with .content (str), .model, .prompt_tokens, .completion_tokens, .total_tokens.
 
     Raises:
         RuntimeError: On HTTP error or unexpected response shape.
@@ -62,7 +75,15 @@ def call_llm(
         resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        model_name = data.get("model", "openclaw")
+        return LLMResponse(
+            content=content,
+            model=model_name,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+        )
     except requests.exceptions.Timeout:
         raise RuntimeError(f"OpenClaw gateway timed out after {timeout}s")
     except requests.exceptions.HTTPError as e:
